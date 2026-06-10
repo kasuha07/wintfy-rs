@@ -1,0 +1,39 @@
+[app]
+log_level = "info"
+show_connection_status_toast = false
+
+[notification]
+min_priority = 1
+tags_as_emoji_prefix = true
+max_title_len = 96
+max_body_len = 512
+
+[network]
+reconnect_initial_seconds = 2
+reconnect_max_seconds = 60
+reconnect_jitter = true
+line_max_bytes = 1048576
+
+[security]
+allow_url_schemes = ["http", "https"]
+max_click_url_len = 2048
+
+[[subscriptions]]
+name = "default"
+server = "https://ntfy.sh"
+topics = ["wintfy-rs"]
+
+[[subscriptions]]
+name = "private-server"
+server = "https://ntfy.example.com"
+topics = ["ops", "deploy"]
+auth = "bearer"
+token = "tk_xxxxxxxxxxxxxxxxx"
+
+[[subscriptions]]
+name = "basic-auth-server"
+server = "https://ntfy.example.net"
+topics = ["home"]
+auth = "basic"
+username = "user"
+password = "pass"

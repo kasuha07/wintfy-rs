@@ -1,0 +1,49 @@
+[package]
+name = "wintfy-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+base64 = "0.22"
+log = { version = "0.4", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
+url = "2"
+windows = { version = "0.61.3", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Power",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+default = ["toml-config", "native-toast", "ureq-client"]
+toml-config = []
+native-toast = []
+winhttp = []
+ureq-client = []
+debug-console = []
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

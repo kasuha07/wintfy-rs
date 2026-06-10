@@ -1,0 +1,206 @@
+use crate::{
+    config::{NotificationConfig, SecurityConfig},
+    ntfy::event::{Notification, NtfyAttachment, NtfyEvent},
+    util::lru::LruIds,
+};
+
+pub struct MessageFilter {
+    ids: LruIds,
+    notification: NotificationConfig,
+    security: SecurityConfig,
+}
+
+impl MessageFilter {
+    pub fn new(notification: NotificationConfig, security: SecurityConfig) -> Self {
+        Self {
+            ids: LruIds::new(256),
+            notification,
+            security,
+        }
+    }
+
+    pub fn filter(&mut self, event: NtfyEvent) -> Option<Notification> {
+        let priority = event.priority.unwrap_or(3);
+        if priority < self.notification.min_priority {
+            return None;
+        }
+        if let Some(id) = event.id.as_deref() {
+            if !self.ids.insert_new(id) {
+                return None;
+            }
+        }
+
+        let topic = event.topic.unwrap_or_else(|| "ntfy".to_string());
+        let mut title = event
+            .title
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| topic.clone());
+        if self.notification.tags_as_emoji_prefix {
+            if let Some(tags) = event.tags.as_ref() {
+                let prefix = tags
+                    .iter()
+                    .filter_map(|tag| tag_to_prefix(tag))
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !prefix.is_empty() {
+                    title = format!("{prefix} {title}");
+                }
+            }
+        }
+        title = truncate(&title, self.notification.max_title_len);
+
+        let mut body = event.message.unwrap_or_default();
+        if let Some(attachment) = event.attachment.as_ref() {
+            let attachment_line = attachment_summary(attachment);
+            if !attachment_line.is_empty() {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(&attachment_line);
+            }
+        }
+        let click_url = valid_click_url(
+            event.click.as_deref(),
+            &self.security.allow_url_schemes,
+            self.security.max_click_url_len,
+        );
+        if body.trim().is_empty() && click_url.is_none() {
+            return None;
+        }
+        body.push_str(&format!("\nTopic: {topic}\nPriority: {priority}"));
+        body = truncate(&body, self.notification.max_body_len);
+
+        Some(Notification {
+            id: event.id.unwrap_or_default(),
+            title,
+            body,
+            topic,
+            priority,
+            click_url,
+        })
+    }
+}
+
+fn attachment_summary(attachment: &NtfyAttachment) -> String {
+    let Some(name) = attachment.name.as_deref() else {
+        return String::new();
+    };
+    match attachment.size {
+        Some(size) => format!("Attachment: {name} ({})", format_size(size)),
+        None => format!("Attachment: {name}"),
+    }
+}
+
+fn format_size(size: u64) -> String {
+    if size >= 1024 * 1024 {
+        format!("{:.1} MB", size as f64 / 1024.0 / 1024.0)
+    } else if size >= 1024 {
+        format!("{:.1} KB", size as f64 / 1024.0)
+    } else {
+        format!("{size} B")
+    }
+}
+
+fn tag_to_prefix(tag: &str) -> Option<&'static str> {
+    match tag.to_ascii_lowercase().as_str() {
+        "warning" | "warn" => Some("⚠️"),
+        "error" | "alert" | "rotating_light" => Some("🚨"),
+        "white_check_mark" | "ok" | "success" => Some("✅"),
+        "x" | "failed" | "failure" => Some("❌"),
+        "info" => Some("ℹ️"),
+        _ => None,
+    }
+}
+
+pub fn truncate(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut output = input.chars().take(keep).collect::<String>();
+    output.push('…');
+    output
+}
+
+pub fn valid_click_url(
+    input: Option<&str>,
+    allowed_schemes: &[String],
+    max_len: usize,
+) -> Option<String> {
+    let input = input?;
+    if input.len() > max_len {
+        log::warn!("click URL too long, ignoring");
+        return None;
+    }
+    let url = url::Url::parse(input).ok()?;
+    if allowed_schemes
+        .iter()
+        .any(|scheme| scheme.eq_ignore_ascii_case(url.scheme()))
+    {
+        Some(url.to_string())
+    } else {
+        log::warn!("click URL scheme rejected: {}", url.scheme());
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_by_priority() {
+        let mut filter = MessageFilter::new(
+            NotificationConfig {
+                min_priority: 4,
+                ..Default::default()
+            },
+            SecurityConfig::default(),
+        );
+        let event = NtfyEvent {
+            event: "message".to_string(),
+            topic: Some("a".to_string()),
+            message: Some("hello".to_string()),
+            priority: Some(3),
+            id: Some("1".to_string()),
+            time: None,
+            title: None,
+            tags: None,
+            click: None,
+            attachment: None,
+        };
+        assert!(filter.filter(event).is_none());
+    }
+
+    #[test]
+    fn suppresses_duplicates() {
+        let mut filter =
+            MessageFilter::new(NotificationConfig::default(), SecurityConfig::default());
+        let event = NtfyEvent {
+            event: "message".to_string(),
+            topic: Some("a".to_string()),
+            message: Some("hello".to_string()),
+            priority: Some(3),
+            id: Some("1".to_string()),
+            time: None,
+            title: None,
+            tags: None,
+            click: None,
+            attachment: None,
+        };
+        assert!(filter.filter(event.clone()).is_some());
+        assert!(filter.filter(event).is_none());
+    }
+
+    #[test]
+    fn rejects_non_http_click() {
+        assert!(
+            valid_click_url(
+                Some("file:///C:/x"),
+                &["http".to_string(), "https".to_string()],
+                2048
+            )
+            .is_none()
+        );
+    }
+}
