@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build package
+        shell: pwsh
+        run: ./scripts/package.ps1
+
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-Item "target/release/wintfy-rs.exe"
+          $zip = Get-ChildItem "dist/wintfy-rs-v*-windows-x64.zip" | Select-Object -First 1
+          if (-not $zip) {
+            throw "package zip was not created"
+          }
+          if ($exe.Length -gt 10MB) {
+            throw "release exe is larger than 10 MB: $($exe.Length) bytes"
+          }
+          @"
+          ### wintfy-rs CI build
+
+          - exe: $($exe.Length) bytes
+          - zip: $($zip.Name), $($zip.Length) bytes
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload CI build
+        uses: actions/upload-artifact@v4
+        with:
+          name: wintfy-rs-windows-x64-ci
+          path: |
+            dist/wintfy-rs-v*-windows-x64.zip
+            target/release/wintfy-rs.exe
+          if-no-files-found: error
+          retention-days: 14

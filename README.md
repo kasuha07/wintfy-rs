@@ -1,5 +1,7 @@
 # wintfy-rs
 
+[![CI](https://github.com/kasuha07/wintfy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/kasuha07/wintfy-rs/actions/workflows/ci.yml)
+
 `wintfy-rs` is a lightweight Windows tray client for [ntfy](https://ntfy.sh/). It reads a TOML config file, subscribes to one or more ntfy JSON streams, and shows native Windows Toast notifications. It is a single Rust executable with no .NET, Electron, WebView, Python, Node.js, JVM, or GUI framework dependency.
 
 ## Features
