@@ -1,9 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct LruIds {
     max: usize,
     ids: VecDeque<String>,
+    seen: HashSet<String>,
 }
 
 impl LruIds {
@@ -11,20 +12,25 @@ impl LruIds {
         Self {
             max,
             ids: VecDeque::with_capacity(max.min(1024)),
+            seen: HashSet::with_capacity(max.min(1024)),
         }
     }
 
     pub fn insert_new(&mut self, id: &str) -> bool {
-        if id.is_empty() {
+        if id.is_empty() || self.max == 0 {
             return true;
         }
-        if self.ids.iter().any(|existing| existing == id) {
+        if self.seen.contains(id) {
             return false;
         }
-        if self.ids.len() >= self.max {
-            self.ids.pop_front();
+        if self.ids.len() >= self.max
+            && let Some(old) = self.ids.pop_front()
+        {
+            self.seen.remove(&old);
         }
-        self.ids.push_back(id.to_string());
+        let id = id.to_string();
+        self.seen.insert(id.clone());
+        self.ids.push_back(id);
         true
     }
 }

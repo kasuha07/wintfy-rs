@@ -1,11 +1,6 @@
-use windows::{
-    Data::Xml::Dom::XmlDocument,
-    UI::Notifications::{ToastNotification, ToastNotificationManager},
-    Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID,
-    core::{HSTRING, PCWSTR},
-};
-
 use crate::{ntfy::event::Notification, platform::paths};
+
+use windows::{Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID, core::PCWSTR};
 
 pub fn init_app_id() -> Result<(), String> {
     let id = wide(paths::AUMID);
@@ -16,6 +11,7 @@ pub fn init_app_id() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "native-toast")]
 pub fn show(notification: &Notification) -> Result<(), String> {
     let xml = toast_xml(
         &notification.title,
@@ -25,15 +21,39 @@ pub fn show(notification: &Notification) -> Result<(), String> {
     show_xml(&xml)
 }
 
+#[cfg(not(feature = "native-toast"))]
+pub fn show(_notification: &Notification) -> Result<(), String> {
+    Err("native toast support is disabled at build time".to_string())
+}
+
+#[cfg(feature = "native-toast")]
 pub fn show_test() -> Result<(), String> {
     show_xml(&toast_xml("wintfy-rs", "Test notification", None))
 }
 
+#[cfg(not(feature = "native-toast"))]
+pub fn show_test() -> Result<(), String> {
+    Err("native toast support is disabled at build time".to_string())
+}
+
+#[cfg(feature = "native-toast")]
 pub fn show_error(title: &str, body: &str) -> Result<(), String> {
     show_xml(&toast_xml(title, body, None))
 }
 
+#[cfg(not(feature = "native-toast"))]
+pub fn show_error(_title: &str, _body: &str) -> Result<(), String> {
+    Err("native toast support is disabled at build time".to_string())
+}
+
+#[cfg(feature = "native-toast")]
 fn show_xml(xml: &str) -> Result<(), String> {
+    use windows::{
+        Data::Xml::Dom::XmlDocument,
+        UI::Notifications::{ToastNotification, ToastNotificationManager},
+        core::HSTRING,
+    };
+
     let doc = XmlDocument::new().map_err(|err| format!("XmlDocument creation failed: {err}"))?;
     doc.LoadXml(&HSTRING::from(xml))
         .map_err(|err| format!("Toast XML parse failed: {err}"))?;
@@ -48,6 +68,7 @@ fn show_xml(xml: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "native-toast")]
 fn toast_xml(title: &str, body: &str, launch: Option<&str>) -> String {
     let activation_attrs = launch
         .map(|url| {
@@ -64,6 +85,7 @@ fn toast_xml(title: &str, body: &str, launch: Option<&str>) -> String {
     )
 }
 
+#[cfg(feature = "native-toast")]
 fn xml_escape_text(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -71,6 +93,7 @@ fn xml_escape_text(input: &str) -> String {
         .replace('>', "&gt;")
 }
 
+#[cfg(feature = "native-toast")]
 fn xml_escape_attr(input: &str) -> String {
     xml_escape_text(input)
         .replace('"', "&quot;")
@@ -81,7 +104,7 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-toast"))]
 mod tests {
     use super::*;
 

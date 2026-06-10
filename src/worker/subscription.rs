@@ -2,15 +2,14 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::Sender,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use crate::{
-    app::AppEvent,
-    config::{Config, SubscriptionConfig},
+    app::{AppEvent, EventSender},
+    config::{Config, NetworkConfig, SubscriptionConfig},
     ntfy::{
         client::{self, StreamItem},
         filter::MessageFilter,
@@ -18,32 +17,64 @@ use crate::{
     worker::reconnect::Backoff,
 };
 
+#[derive(Clone)]
+struct WorkerNetwork {
+    reconnect_initial_seconds: u64,
+    reconnect_max_seconds: u64,
+    reconnect_jitter: bool,
+    line_max_bytes: usize,
+}
+
+impl From<&NetworkConfig> for WorkerNetwork {
+    fn from(network: &NetworkConfig) -> Self {
+        Self {
+            reconnect_initial_seconds: network.reconnect_initial_seconds,
+            reconnect_max_seconds: network.reconnect_max_seconds,
+            reconnect_jitter: network.reconnect_jitter,
+            line_max_bytes: network.line_max_bytes,
+        }
+    }
+}
+
 pub struct WorkerGroup {
     shutdown: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
 }
 
 impl WorkerGroup {
-    pub fn start(config: &Config, tx: Sender<AppEvent>) -> Self {
+    pub fn start(config: &Config, tx: EventSender) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
+        let http = match client::agent(config.security.skip_tls_verify) {
+            Ok(http) => Arc::new(http),
+            Err(err) => {
+                log::error!("cannot initialize shared HTTP client: {err}");
+                for sub in &config.subscriptions {
+                    let _ = tx.send(AppEvent::SubscriptionDisconnected {
+                        name: sub.name.clone(),
+                        reason: err.clone(),
+                    });
+                }
+                return Self { shutdown, handles };
+            }
+        };
+
         for sub in config.subscriptions.clone() {
             let tx = tx.clone();
+            let http = http.clone();
             let worker_shutdown = shutdown.clone();
             let notification = config.notification.clone();
             let security = config.security.clone();
-            let network = config.network.clone();
+            let network = WorkerNetwork::from(&config.network);
             let handle = thread::Builder::new()
                 .name(format!("ntfy-{}", sub.name))
                 .spawn(move || {
                     run_worker(
+                        http,
                         sub,
                         notification,
                         security,
-                        network.reconnect_initial_seconds,
-                        network.reconnect_max_seconds,
-                        network.reconnect_jitter,
-                        network.line_max_bytes,
+                        network,
                         tx,
                         worker_shutdown,
                     );
@@ -58,6 +89,9 @@ impl WorkerGroup {
 
     pub fn stop(self, timeout: Duration) {
         self.shutdown.store(true, Ordering::Relaxed);
+        for handle in &self.handles {
+            handle.thread().unpark();
+        }
         let deadline = Instant::now() + timeout;
         for handle in self.handles {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -70,45 +104,28 @@ impl WorkerGroup {
 }
 
 fn run_worker(
+    http: Arc<client::HttpClient>,
     sub: SubscriptionConfig,
     notification: crate::config::NotificationConfig,
     security: crate::config::SecurityConfig,
-    reconnect_initial_seconds: u64,
-    reconnect_max_seconds: u64,
-    reconnect_jitter: bool,
-    line_max_bytes: usize,
-    tx: Sender<AppEvent>,
+    network: WorkerNetwork,
+    tx: EventSender,
     shutdown: Arc<AtomicBool>,
 ) {
-    let agent = match client::agent(security.skip_tls_verify) {
-        Ok(agent) => agent,
-        Err(err) => {
-            log::error!(
-                "subscription {} cannot initialize HTTP client: {err}",
-                sub.name
-            );
-            let _ = tx.send(AppEvent::SubscriptionDisconnected {
-                name: sub.name,
-                reason: err,
-            });
-            return;
-        }
-    };
     let mut backoff = Backoff::new(
-        reconnect_initial_seconds,
-        reconnect_max_seconds,
-        reconnect_jitter,
+        network.reconnect_initial_seconds,
+        network.reconnect_max_seconds,
+        network.reconnect_jitter,
     );
     let mut filter = MessageFilter::new(notification, security);
-    let version = env!("CARGO_PKG_VERSION");
 
     while !shutdown.load(Ordering::Relaxed) {
         let name = sub.name.clone();
         let result = client::read_stream(
-            &agent,
+            &http,
             &sub,
-            version,
-            line_max_bytes,
+            client::user_agent(),
+            network.line_max_bytes,
             &shutdown,
             |item| match item {
                 StreamItem::Open => {
@@ -152,7 +169,7 @@ fn run_worker(
 fn sleep_until_shutdown(delay: Duration, shutdown: &AtomicBool) {
     let deadline = Instant::now() + delay;
     while Instant::now() < deadline && !shutdown.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(200));
+        thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::{
     config::{NotificationConfig, SecurityConfig},
     ntfy::event::{Notification, NtfyAttachment, NtfyEvent},
-    util::lru::LruIds,
+    util::{lru::LruIds, url::ParsedUrl},
 };
 
 const SAFE_CLICK_URL_SCHEMES: &[&str] = &["http", "https"];
@@ -26,10 +26,10 @@ impl MessageFilter {
         if priority < self.notification.min_priority {
             return None;
         }
-        if let Some(id) = event.id.as_deref() {
-            if !self.ids.insert_new(id) {
-                return None;
-            }
+        if let Some(id) = event.id.as_deref()
+            && !self.ids.insert_new(id)
+        {
+            return None;
         }
 
         let topic = event.topic.unwrap_or_else(|| "ntfy".to_string());
@@ -37,16 +37,19 @@ impl MessageFilter {
             .title
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| topic.clone());
-        if self.notification.tags_as_emoji_prefix {
-            if let Some(tags) = event.tags.as_ref() {
-                let prefix = tags
-                    .iter()
-                    .filter_map(|tag| tag_to_prefix(tag))
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !prefix.is_empty() {
-                    title = format!("{prefix} {title}");
+        if self.notification.tags_as_emoji_prefix
+            && let Some(tags) = event.tags.as_ref()
+        {
+            let mut prefix = String::new();
+            for tag in tags {
+                if let Some(value) = tag_to_prefix(tag) {
+                    prefix.push_str(value);
                 }
+            }
+            if !prefix.is_empty() {
+                prefix.push(' ');
+                prefix.push_str(&title);
+                title = prefix;
             }
         }
         title = truncate(&title, self.notification.max_title_len);
@@ -70,7 +73,8 @@ impl MessageFilter {
         if body.trim().is_empty() && click_url.is_none() {
             return None;
         }
-        body.push_str(&format!("\nTopic: {topic}\nPriority: {priority}"));
+        use std::fmt::Write as _;
+        let _ = write!(body, "\nTopic: {topic}\nPriority: {priority}");
         body = truncate(&body, self.notification.max_body_len);
 
         Some(Notification {
@@ -116,11 +120,24 @@ fn tag_to_prefix(tag: &str) -> Option<&'static str> {
 }
 
 pub fn truncate(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
     let keep = max_chars.saturating_sub(1);
-    let mut output = input.chars().take(keep).collect::<String>();
+    let mut chars = input.char_indices();
+    for _ in 0..max_chars {
+        if chars.next().is_none() {
+            return input.to_string();
+        }
+    }
+    let byte_end = if keep == 0 {
+        0
+    } else {
+        input
+            .char_indices()
+            .nth(keep)
+            .map(|(idx, _)| idx)
+            .unwrap_or(input.len())
+    };
+    let mut output = String::with_capacity(byte_end + '…'.len_utf8());
+    output.push_str(&input[..byte_end]);
     output.push('…');
     output
 }
@@ -136,7 +153,7 @@ pub fn valid_click_url(
         log::warn!("click URL too long, ignoring");
         return None;
     }
-    let url = url::Url::parse(input).ok()?;
+    let url = ParsedUrl::parse(input).ok()?;
     let scheme = url.scheme();
     if !allowed_schemes
         .iter()
@@ -149,11 +166,11 @@ pub fn valid_click_url(
         .iter()
         .any(|safe| safe.eq_ignore_ascii_case(scheme))
     {
-        return Some(url.to_string());
+        return Some(input.to_string());
     }
     if allow_dangerous_schemes {
         log::warn!("dangerous click URL scheme allowed by config: {scheme}");
-        Some(url.to_string())
+        Some(input.to_string())
     } else {
         log::warn!("dangerous click URL scheme rejected: {scheme}");
         None

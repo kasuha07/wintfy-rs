@@ -1,8 +1,22 @@
 use std::{
     process::ExitCode,
-    sync::mpsc::{self, Receiver, Sender},
-    thread,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     time::Duration,
+};
+
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_FAILED, WAIT_OBJECT_0},
+        System::Threading::{CreateEventW, INFINITE, ResetEvent, SetEvent},
+        UI::WindowsAndMessaging::{
+            DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+            TranslateMessage, WM_QUIT,
+        },
+    },
+    core::PCWSTR,
 };
 
 use crate::{
@@ -36,6 +50,61 @@ pub enum AppEvent {
     },
     ConfigReloaded,
     PowerResume,
+}
+
+#[derive(Clone)]
+pub struct EventSender {
+    tx: Sender<AppEvent>,
+    wake: Arc<WakeEvent>,
+}
+
+impl EventSender {
+    fn new(tx: Sender<AppEvent>, wake: Arc<WakeEvent>) -> Self {
+        Self { tx, wake }
+    }
+
+    pub fn send(&self, event: AppEvent) -> bool {
+        if self.tx.send(event).is_err() {
+            return false;
+        }
+        self.wake.set();
+        true
+    }
+}
+
+struct WakeEvent {
+    handle: HANDLE,
+}
+
+unsafe impl Send for WakeEvent {}
+unsafe impl Sync for WakeEvent {}
+
+impl WakeEvent {
+    fn create() -> Result<Arc<Self>, String> {
+        let handle = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+            .map_err(|err| format!("CreateEventW failed: {err}"))?;
+        Ok(Arc::new(Self { handle }))
+    }
+
+    fn set(&self) {
+        unsafe {
+            let _ = SetEvent(self.handle);
+        }
+    }
+
+    fn reset(&self) {
+        unsafe {
+            let _ = ResetEvent(self.handle);
+        }
+    }
+}
+
+impl Drop for WakeEvent {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
 }
 
 pub fn run() -> Result<ExitCode, String> {
@@ -112,28 +181,22 @@ fn run_tray(config_arg: Option<std::path::PathBuf>) -> Result<ExitCode, String> 
     log::info!("wintfy-rs starting");
     crate::toast::init_app_id()?;
 
-    let (tx, rx) = mpsc::channel();
+    let (raw_tx, rx) = mpsc::channel();
+    let wake = WakeEvent::create()?;
+    let tx = EventSender::new(raw_tx, wake.clone());
     let tray = crate::tray::TrayApp::create(tx.clone())?;
     let tray_handle = tray.handle();
     if startup_config_error.is_some() {
         tray_handle.set_tooltip("wintfy-rs: config error");
     }
-    let runtime_tx = tx.clone();
     let mut runtime = Runtime::new(loaded, tx, tray_handle);
-    let event_thread = thread::Builder::new()
-        .name("app-events".to_string())
-        .spawn(move || runtime.run(rx))
-        .map_err(|err| format!("failed to spawn event thread: {err}"))?;
-
-    tray.message_loop();
-    let _ = runtime_tx.send(AppEvent::TrayQuit);
-    let _ = event_thread.join();
+    runtime.run(&tray, &rx, &wake);
     Ok(ExitCode::SUCCESS)
 }
 
 struct Runtime {
     loaded: LoadedConfig,
-    tx: Sender<AppEvent>,
+    tx: EventSender,
     tray: TrayHandle,
     workers: Option<WorkerGroup>,
     muted: bool,
@@ -141,7 +204,7 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(loaded: LoadedConfig, tx: Sender<AppEvent>, tray: TrayHandle) -> Self {
+    fn new(loaded: LoadedConfig, tx: EventSender, tray: TrayHandle) -> Self {
         let workers = if loaded.config.subscriptions.is_empty() {
             None
         } else {
@@ -157,101 +220,132 @@ impl Runtime {
         }
     }
 
-    fn run(&mut self, rx: Receiver<AppEvent>) {
-        while let Ok(event) = rx.recv() {
-            match event {
-                AppEvent::TrayReloadConfig => self.reload_config(),
-                AppEvent::TrayOpenConfig => {
-                    if let Err(err) = shell::open_path(&self.loaded.path) {
-                        log::warn!("{err}");
+    fn run(&mut self, tray: &crate::tray::TrayApp, rx: &Receiver<AppEvent>, wake: &WakeEvent) {
+        let mut quit = false;
+        while !quit {
+            match wait_for_app_or_window_event(wake.handle) {
+                Ok(LoopSignal::AppEvent) => {
+                    wake.reset();
+                    quit = self.drain_events(rx);
+                }
+                Ok(LoopSignal::WindowMessage) => {
+                    if tray.dispatch_pending_messages() {
+                        quit = true;
                     }
+                    quit |= self.drain_events(rx);
                 }
-                AppEvent::TrayOpenLogs => {
-                    if let Ok(path) = paths::log_file() {
-                        let target = path.parent().unwrap_or(&path);
-                        if let Err(err) = shell::open_path(target) {
-                            log::warn!("{err}");
-                        }
-                    }
-                }
-                AppEvent::TrayTestNotification => {
-                    if let Err(err) = crate::toast::show_test() {
-                        log::warn!("test notification failed: {err}");
-                    }
-                }
-                AppEvent::TrayToggleMute => {
-                    self.muted = !self.muted;
-                    self.tray.set_muted(self.muted);
-                    self.tray.set_tooltip(if self.muted {
-                        "wintfy-rs: muted"
-                    } else {
-                        "wintfy-rs"
-                    });
-                    log::info!(
-                        "notifications {}",
-                        if self.muted { "muted" } else { "unmuted" }
-                    );
-                }
-                AppEvent::TrayToggleStartWithWindows => {
-                    match shell::set_startup_enabled(!shell::startup_enabled()) {
-                        Ok(enabled) => {
-                            self.tray.set_start_with_windows(enabled);
-                            log::info!(
-                                "start with Windows {}",
-                                if enabled { "enabled" } else { "disabled" }
-                            );
-                        }
-                        Err(err) => log::warn!("failed to change startup shortcut: {err}"),
-                    }
-                }
-                AppEvent::TrayQuit => {
-                    self.shutdown();
-                    self.tray.quit();
+                Err(err) => {
+                    log::error!("{err}");
                     break;
-                }
-                AppEvent::SubscriptionConnected { name } => {
-                    log::info!("subscription {name} connected");
-                    self.tray.set_tooltip("wintfy-rs: connected");
-                }
-                AppEvent::SubscriptionDisconnected { name, reason } => {
-                    log::warn!("subscription {name} disconnected: {reason}");
-                    self.tray.set_tooltip("wintfy-rs: disconnected");
-                    if self.loaded.config.app.show_connection_status_toast {
-                        let _ = crate::toast::show_error(
-                            "wintfy-rs disconnected",
-                            &format!("{name}: {reason}"),
-                        );
-                    }
-                }
-                AppEvent::NtfyMessage {
-                    subscription,
-                    notification,
-                } => {
-                    if self.muted {
-                        log::debug!(
-                            "notification from subscription {subscription} skipped because muted"
-                        );
-                        continue;
-                    }
-                    log::debug!("notification from subscription {subscription}");
-                    if let Some(url) = notification.click_url.as_deref() {
-                        log::debug!(
-                            "notification has click URL {}",
-                            crate::util::redact::redact_secret(url)
-                        );
-                    }
-                    if let Err(err) = crate::toast::show(&notification) {
-                        log::warn!("toast failed: {err}");
-                    }
-                }
-                AppEvent::ConfigReloaded => {}
-                AppEvent::PowerResume => {
-                    log::info!("power resume detected, reconnecting subscriptions");
-                    self.restart_workers();
                 }
             }
         }
         self.shutdown();
+    }
+
+    fn drain_events(&mut self, rx: &Receiver<AppEvent>) -> bool {
+        let mut quit = false;
+        while let Ok(event) = rx.try_recv() {
+            if self.handle_event(event) {
+                quit = true;
+            }
+        }
+        quit
+    }
+
+    fn handle_event(&mut self, event: AppEvent) -> bool {
+        match event {
+            AppEvent::TrayReloadConfig => self.reload_config(),
+            AppEvent::TrayOpenConfig => {
+                if let Err(err) = shell::open_path(&self.loaded.path) {
+                    log::warn!("{err}");
+                }
+            }
+            AppEvent::TrayOpenLogs => {
+                if let Ok(path) = paths::log_file() {
+                    let target = path.parent().unwrap_or(&path);
+                    if let Err(err) = shell::open_path(target) {
+                        log::warn!("{err}");
+                    }
+                }
+            }
+            AppEvent::TrayTestNotification => {
+                if let Err(err) = crate::toast::show_test() {
+                    log::warn!("test notification failed: {err}");
+                }
+            }
+            AppEvent::TrayToggleMute => {
+                self.muted = !self.muted;
+                self.tray.set_muted(self.muted);
+                self.tray.set_tooltip(if self.muted {
+                    "wintfy-rs: muted"
+                } else {
+                    "wintfy-rs"
+                });
+                log::info!(
+                    "notifications {}",
+                    if self.muted { "muted" } else { "unmuted" }
+                );
+            }
+            AppEvent::TrayToggleStartWithWindows => {
+                match shell::set_startup_enabled(!shell::startup_enabled()) {
+                    Ok(enabled) => {
+                        self.tray.set_start_with_windows(enabled);
+                        log::info!(
+                            "start with Windows {}",
+                            if enabled { "enabled" } else { "disabled" }
+                        );
+                    }
+                    Err(err) => log::warn!("failed to change startup shortcut: {err}"),
+                }
+            }
+            AppEvent::TrayQuit => {
+                self.shutdown();
+                self.tray.quit();
+                return true;
+            }
+            AppEvent::SubscriptionConnected { name } => {
+                log::info!("subscription {name} connected");
+                self.tray.set_tooltip("wintfy-rs: connected");
+            }
+            AppEvent::SubscriptionDisconnected { name, reason } => {
+                log::warn!("subscription {name} disconnected: {reason}");
+                self.tray.set_tooltip("wintfy-rs: disconnected");
+                if self.loaded.config.app.show_connection_status_toast {
+                    let _ = crate::toast::show_error(
+                        "wintfy-rs disconnected",
+                        &format!("{name}: {reason}"),
+                    );
+                }
+            }
+            AppEvent::NtfyMessage {
+                subscription,
+                notification,
+            } => {
+                if self.muted {
+                    log::debug!(
+                        "notification from subscription {subscription} skipped because muted"
+                    );
+                    return false;
+                }
+                log::debug!("notification from subscription {subscription}");
+                if let Some(url) = notification.click_url.as_deref() {
+                    log::debug!(
+                        "notification has click URL {}",
+                        crate::util::redact::redact_secret(url)
+                    );
+                }
+                if let Err(err) = crate::toast::show(&notification) {
+                    log::warn!("toast failed: {err}");
+                }
+            }
+            AppEvent::ConfigReloaded => {}
+            AppEvent::PowerResume => {
+                log::info!("power resume detected, reconnecting subscriptions");
+                self.restart_workers();
+            }
+        }
+        false
     }
 
     fn reload_config(&mut self) {
@@ -294,5 +388,40 @@ impl Runtime {
         self.stop_workers();
         log::info!("wintfy-rs exiting");
         log::logger().flush();
+    }
+}
+
+enum LoopSignal {
+    AppEvent,
+    WindowMessage,
+}
+
+fn wait_for_app_or_window_event(wake: HANDLE) -> Result<LoopSignal, String> {
+    let wait = unsafe { MsgWaitForMultipleObjects(Some(&[wake]), false, INFINITE, QS_ALLINPUT) };
+    if wait == WAIT_FAILED {
+        return Err(format!("MsgWaitForMultipleObjects failed: {:?}", unsafe {
+            GetLastError()
+        }));
+    }
+    if wait == WAIT_OBJECT_0 {
+        Ok(LoopSignal::AppEvent)
+    } else {
+        Ok(LoopSignal::WindowMessage)
+    }
+}
+
+pub(crate) fn dispatch_pending_window_messages() -> bool {
+    unsafe {
+        let mut quit = false;
+        let mut msg = MSG::default();
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            if msg.message == WM_QUIT {
+                quit = true;
+                continue;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        quit
     }
 }

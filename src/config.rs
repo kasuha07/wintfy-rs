@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::platform::paths;
+use crate::util::url::{self, validate_http_server};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -228,23 +229,35 @@ fn validate_subscription(
     if sub.server.trim().is_empty() {
         return Err(format!("subscription {} server is required", sub.name));
     }
-    let parsed = url::Url::parse(&sub.server)
-        .map_err(|err| format!("subscription {} server URL is invalid: {err}", sub.name))?;
-    match parsed.scheme() {
-        "https" => {}
-        "http" if security.allow_http => {}
-        "http" => {
+    match validate_http_server(&sub.server, security.allow_http) {
+        Ok("https") => {}
+        Ok("http") => {}
+        Err(url::UrlError::UnsupportedScheme)
+            if sub.server.len() >= 5 && sub.server[..5].eq_ignore_ascii_case("http:") =>
+        {
             return Err(format!(
                 "subscription {} HTTP server URLs require security.allow_http = true",
                 sub.name
             ));
         }
-        other => {
+        Err(url::UrlError::UnsupportedScheme) => {
+            let scheme = sub
+                .server
+                .split_once(':')
+                .map(|(scheme, _)| scheme)
+                .unwrap_or("");
             return Err(format!(
-                "subscription {} unsupported server scheme: {other}",
+                "subscription {} unsupported server scheme: {scheme}",
                 sub.name
             ));
         }
+        Err(err) => {
+            return Err(format!(
+                "subscription {} server URL is invalid: {err}",
+                sub.name
+            ));
+        }
+        Ok(_) => unreachable!(),
     }
     if sub.topics.is_empty() {
         return Err(format!(
@@ -253,7 +266,7 @@ fn validate_subscription(
         ));
     }
     for topic in &sub.topics {
-        if topic.trim().is_empty() || topic.contains('/') || topic.contains(',') {
+        if !url::valid_topic(topic.trim()) {
             return Err(format!(
                 "subscription {} has invalid topic: {topic}",
                 sub.name
@@ -315,7 +328,7 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if portable.exists() {
         return Ok(portable);
     }
-    Ok(paths::config_file()?)
+    paths::config_file()
 }
 
 pub fn ensure_default_config(path: &Path) -> Result<(), String> {

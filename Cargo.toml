@@ -5,25 +5,20 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-base64 = "0.22"
 log = { version = "0.4", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"
-ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
-url = "2"
-windows = { version = "0.61.3", features = [
-    "Data_Xml_Dom",
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+native-tls = { version = "0.2.18", default-features = false, optional = true }
+ureq = { version = "2.12", default-features = false, features = ["native-tls"], optional = true }
+windows = { version = "0.61.3", default-features = false, features = [
     "Foundation",
-    "UI_Notifications",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
-    "Win32_Globalization",
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
-    "Win32_System_Ole",
     "Win32_System_Power",
     "Win32_System_Threading",
     "Win32_System_Variant",
@@ -34,11 +29,17 @@ windows = { version = "0.61.3", features = [
 ] }
 
 [features]
-default = ["toml-config", "native-toast", "ureq-client"]
+default = ["toml-config", "native-toast", "native-tls-client"]
 toml-config = []
-native-toast = []
-winhttp = []
-ureq-client = []
+native-toast = [
+    "windows/Data",
+    "windows/Data_Xml_Dom",
+    "windows/UI",
+    "windows/UI_Notifications",
+]
+native-tls-client = ["dep:native-tls"]
+winhttp = ["windows/Win32_Networking_WinHttp"]
+ureq-client = ["dep:ureq"]
 debug-console = []
 
 [profile.release]

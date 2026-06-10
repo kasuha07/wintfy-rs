@@ -50,13 +50,11 @@ fn redact_key_values(input: &str, key: &str) -> String {
 pub fn redact_url_query(input: &str) -> String {
     let mut result = Vec::new();
     for part in input.split_whitespace() {
-        if let Ok(mut url) = url::Url::parse(part) {
-            if url.query().is_some() {
-                url.set_query(Some("<redacted>"));
-                result.push(url.to_string());
-            } else {
-                result.push(part.to_string());
-            }
+        if let Ok(url) = crate::util::url::ParsedUrl::parse(part) {
+            result.push(
+                url.with_redacted_query()
+                    .unwrap_or_else(|| part.to_string()),
+            );
         } else {
             result.push(part.to_string());
         }

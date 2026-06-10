@@ -30,6 +30,28 @@ cargo build --release
 
 The zip is written to `dist\wintfy-rs-v0.1.0-windows-x64.zip`.
 
+Release builds use a minimal blocking HTTP/1.1 client with native Windows TLS
+by default. To build the smaller WinHTTP backend instead:
+
+```powershell
+cargo build --release --no-default-features --features toml-config,native-toast,winhttp
+```
+
+To build with the compatibility `ureq` backend:
+
+```powershell
+cargo build --release --no-default-features --features toml-config,native-toast,ureq-client
+```
+
+Local release measurements on Windows with local mock subscriptions:
+
+```text
+default native-tls backend, 1 subscription: 568,320 bytes, ~1.7 MB private memory, 6 threads
+default native-tls backend, 2 subscriptions: 568,320 bytes, ~1.9 MB private memory, 7 threads
+WinHTTP backend, 1 subscription:             546,816 bytes, ~2.3 MB private memory, 10 threads
+ureq backend, 1 subscription:                831,488 bytes, ~1.8 MB private memory, 7 threads
+```
+
 ## Install
 
 Run from PowerShell:

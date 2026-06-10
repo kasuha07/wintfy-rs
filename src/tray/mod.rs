@@ -1,8 +1,7 @@
 use std::{
     ffi::c_void,
     mem::size_of,
-    ptr::null_mut,
-    sync::{Arc, Mutex, mpsc::Sender},
+    sync::{Arc, Mutex},
 };
 
 use windows::{
@@ -16,20 +15,20 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CREATESTRUCTW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW,
-                DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-                GetCursorPos, GetMessageW, GetWindowLongPtrW, HMENU, IDC_ARROW, IDI_APPLICATION,
-                LoadCursorW, LoadIconW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
-                PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-                SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-                TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_CREATE,
-                WM_DESTROY, WM_POWERBROADCAST, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPED,
+                DefWindowProcW, DestroyMenu, DestroyWindow, GWLP_USERDATA, GetCursorPos,
+                GetWindowLongPtrW, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW,
+                MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, PostQuitMessage,
+                RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW,
+                TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
+                WM_COMMAND, WM_CREATE, WM_DESTROY, WM_POWERBROADCAST, WM_RBUTTONUP, WM_USER,
+                WNDCLASSW, WS_OVERLAPPED,
             },
         },
     },
     core::PCWSTR,
 };
 
-use crate::app::AppEvent;
+use crate::app::{AppEvent, EventSender};
 
 const WM_TRAYICON: u32 = WM_USER + 1;
 const WM_QUIT_APP: u32 = WM_APP + 1;
@@ -42,7 +41,7 @@ const ID_MUTE: usize = 1006;
 const ID_STARTUP: usize = 1007;
 
 struct TrayState {
-    tx: Sender<AppEvent>,
+    tx: EventSender,
     taskbar_created: u32,
     flags: Arc<Mutex<TrayFlags>>,
 }
@@ -59,7 +58,7 @@ struct TrayFlags {
 }
 
 struct TrayInit {
-    tx: Sender<AppEvent>,
+    tx: EventSender,
     flags: Arc<Mutex<TrayFlags>>,
 }
 
@@ -73,7 +72,7 @@ unsafe impl Send for TrayHandle {}
 unsafe impl Sync for TrayHandle {}
 
 impl TrayApp {
-    pub fn create(tx: Sender<AppEvent>) -> Result<Self, String> {
+    pub fn create(tx: EventSender) -> Result<Self, String> {
         unsafe {
             let class_name = wide("wintfy-rs-tray-window");
             let hinstance =
@@ -116,7 +115,7 @@ impl TrayApp {
                 Some(init_ptr.cast()),
             )
             .map_err(|err| format!("CreateWindowExW failed: {err}"))?;
-            if hwnd.0 == null_mut() {
+            if hwnd.0.is_null() {
                 let _ = Box::from_raw(init_ptr);
                 return Err(format!(
                     "CreateWindowExW returned null: {:?}",
@@ -128,15 +127,8 @@ impl TrayApp {
         }
     }
 
-    pub fn message_loop(&self) -> i32 {
-        unsafe {
-            let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).into() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            msg.wParam.0 as i32
-        }
+    pub fn dispatch_pending_messages(&self) -> bool {
+        crate::app::dispatch_pending_window_messages()
     }
 
     pub fn handle(&self) -> TrayHandle {
@@ -358,9 +350,9 @@ unsafe fn add_icon(hwnd: HWND, tip: &str) -> Result<(), String> {
     data.uCallbackMessage = WM_TRAYICON;
     data.hIcon = unsafe { LoadIconW(None, IDI_APPLICATION) }
         .map_err(|err| format!("LoadIconW failed: {err}"))?;
-    if unsafe { Shell_NotifyIconW(NIM_ADD, &mut data) }.as_bool() {
+    if unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
         data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &mut data) };
+        let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) };
         Ok(())
     } else {
         Err(format!("Shell_NotifyIconW add failed: {:?}", unsafe {
@@ -373,7 +365,7 @@ fn modify_icon(hwnd: HWND, tip: &str) -> Result<(), String> {
     unsafe {
         let mut data = notify_data(hwnd, tip);
         data.uFlags = NIF_TIP;
-        if Shell_NotifyIconW(NIM_MODIFY, &mut data).as_bool() {
+        if Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() {
             Ok(())
         } else {
             Err(format!(
@@ -385,9 +377,9 @@ fn modify_icon(hwnd: HWND, tip: &str) -> Result<(), String> {
 }
 
 unsafe fn remove_icon(hwnd: HWND) {
-    let mut data = notify_data(hwnd, "wintfy-rs");
+    let data = notify_data(hwnd, "wintfy-rs");
     unsafe {
-        let _ = Shell_NotifyIconW(NIM_DELETE, &mut data);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
     }
 }
 

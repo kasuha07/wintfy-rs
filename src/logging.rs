@@ -4,23 +4,26 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const LOG_BACKUPS: usize = 3;
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+static LOG_LEVEL: AtomicUsize = AtomicUsize::new(LevelFilter::Info as usize);
 
 pub struct FileLogger {
-    level: LevelFilter,
     path: PathBuf,
     file: Mutex<File>,
 }
 
 impl Log for FileLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() <= self.level
+        metadata.level() <= current_level()
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -42,10 +45,10 @@ impl Log for FileLogger {
         if file.metadata().map(|m| m.len()).unwrap_or(0) > MAX_LOG_BYTES {
             drop(file);
             let _ = rotate_logs(&self.path);
-            if let Ok(new_file) = open_log_file(&self.path) {
-                if let Ok(mut guard) = self.file.lock() {
-                    *guard = new_file;
-                }
+            if let Ok(new_file) = open_log_file(&self.path)
+                && let Ok(mut guard) = self.file.lock()
+            {
+                *guard = new_file;
             }
         }
     }
@@ -59,9 +62,9 @@ impl Log for FileLogger {
 
 pub fn init(level_name: &str) -> Result<PathBuf, String> {
     let path = paths::log_file()?;
+    let level = config::parse_level(level_name).unwrap_or(LevelFilter::Info);
     if let Some(existing) = LOG_PATH.get() {
-        let level = config::parse_level(level_name).unwrap_or(LevelFilter::Info);
-        log::set_max_level(level);
+        set_level(level);
         return Ok(existing.clone());
     }
     if let Some(parent) = path.parent() {
@@ -70,9 +73,7 @@ pub fn init(level_name: &str) -> Result<PathBuf, String> {
     }
     rotate_logs_if_needed(&path)?;
     let file = open_log_file(&path)?;
-    let level = config::parse_level(level_name).unwrap_or(LevelFilter::Info);
     let logger = FileLogger {
-        level,
         path: path.clone(),
         file: Mutex::new(file),
     };
@@ -82,7 +83,7 @@ pub fn init(level_name: &str) -> Result<PathBuf, String> {
         }
         Err(_) => return Ok(path),
     }
-    log::set_max_level(level);
+    set_level(level);
     Ok(path)
 }
 
@@ -135,4 +136,20 @@ fn timestamp_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn set_level(level: LevelFilter) {
+    LOG_LEVEL.store(level as usize, Ordering::Relaxed);
+    log::set_max_level(level);
+}
+
+fn current_level() -> LevelFilter {
+    match LOG_LEVEL.load(Ordering::Relaxed) {
+        0 => LevelFilter::Off,
+        1 => LevelFilter::Error,
+        2 => LevelFilter::Warn,
+        3 => LevelFilter::Info,
+        4 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    }
 }
