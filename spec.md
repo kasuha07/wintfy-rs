@@ -419,7 +419,10 @@ Toast XML 结构应尽量简单，MVP 不使用图片。
 
 1. 如果 ntfy message 存在 `click` 字段，打开对应 URL。
 2. 否则不执行操作。
-3. 如果 URL scheme 非 `http` 或 `https`，默认拒绝，除非配置中显式允许。
+3. URL scheme 必须在 `security.allow_url_schemes` 中。
+4. `http` 和 `https` 是内置安全 scheme。
+5. 非 `http`/`https` scheme 必须同时设置 `security.allow_dangerous_url_schemes = true` 才允许。
+6. 开启危险 scheme 可能让远端 ntfy 消息触发本地协议处理器，例如 `file:`、`ms-settings:` 或自定义协议，只应在可信 topic 中使用。
 
 允许的 URL scheme：
 

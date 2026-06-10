@@ -16,6 +16,7 @@ line_max_bytes = 1048576
 
 [security]
 allow_url_schemes = ["http", "https"]
+allow_dangerous_url_schemes = false
 max_click_url_len = 2048
 
 [[subscriptions]]

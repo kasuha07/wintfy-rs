@@ -45,6 +45,7 @@ pub struct NetworkConfig {
 #[serde(default)]
 pub struct SecurityConfig {
     pub allow_url_schemes: Vec<String>,
+    pub allow_dangerous_url_schemes: bool,
     pub max_click_url_len: usize,
 }
 
@@ -130,6 +131,7 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             allow_url_schemes: vec!["http".to_string(), "https".to_string()],
+            allow_dangerous_url_schemes: false,
             max_click_url_len: 2048,
         }
     }
@@ -198,6 +200,11 @@ reconnect_initial_seconds = 2
 reconnect_max_seconds = 60
 reconnect_jitter = true
 line_max_bytes = 1048576
+
+[security]
+allow_url_schemes = ["http", "https"]
+allow_dangerous_url_schemes = false
+max_click_url_len = 2048
 
 [[subscriptions]]
 name = "default"

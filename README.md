@@ -194,7 +194,7 @@ Run `wintfy-rs.exe --install`, then `wintfy-rs.exe --test-notification`. Desktop
 Yes. A server such as `https://example.com/ntfy` becomes `https://example.com/ntfy/topic/json`.
 
 **Are arbitrary commands supported from notifications?**  
-No. Click URLs are limited to `http` and `https` by default. The app does not execute shell commands from ntfy messages.
+No. Click URLs are limited to `http` and `https` by default. Other URL schemes are rejected even if added to `security.allow_url_schemes`, unless `security.allow_dangerous_url_schemes = true` is also set. Enabling that option can let remote ntfy messages trigger local protocol handlers such as `file:` or `ms-settings:`, so only use it for trusted topics.
 
 **Does it download attachments?**  
 No. Attachment name and size are appended to the notification body.

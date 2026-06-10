@@ -4,6 +4,8 @@ use crate::{
     util::lru::LruIds,
 };
 
+const SAFE_CLICK_URL_SCHEMES: &[&str] = &["http", "https"];
+
 pub struct MessageFilter {
     ids: LruIds,
     notification: NotificationConfig,
@@ -62,6 +64,7 @@ impl MessageFilter {
         let click_url = valid_click_url(
             event.click.as_deref(),
             &self.security.allow_url_schemes,
+            self.security.allow_dangerous_url_schemes,
             self.security.max_click_url_len,
         );
         if body.trim().is_empty() && click_url.is_none() {
@@ -125,6 +128,7 @@ pub fn truncate(input: &str, max_chars: usize) -> String {
 pub fn valid_click_url(
     input: Option<&str>,
     allowed_schemes: &[String],
+    allow_dangerous_schemes: bool,
     max_len: usize,
 ) -> Option<String> {
     let input = input?;
@@ -133,13 +137,25 @@ pub fn valid_click_url(
         return None;
     }
     let url = url::Url::parse(input).ok()?;
-    if allowed_schemes
+    let scheme = url.scheme();
+    if !allowed_schemes
         .iter()
-        .any(|scheme| scheme.eq_ignore_ascii_case(url.scheme()))
+        .any(|allowed| allowed.eq_ignore_ascii_case(scheme))
     {
+        log::warn!("click URL scheme rejected by allowlist: {scheme}");
+        return None;
+    }
+    if SAFE_CLICK_URL_SCHEMES
+        .iter()
+        .any(|safe| safe.eq_ignore_ascii_case(scheme))
+    {
+        return Some(url.to_string());
+    }
+    if allow_dangerous_schemes {
+        log::warn!("dangerous click URL scheme allowed by config: {scheme}");
         Some(url.to_string())
     } else {
-        log::warn!("click URL scheme rejected: {}", url.scheme());
+        log::warn!("dangerous click URL scheme rejected: {scheme}");
         None
     }
 }
@@ -198,9 +214,41 @@ mod tests {
             valid_click_url(
                 Some("file:///C:/x"),
                 &["http".to_string(), "https".to_string()],
+                false,
                 2048
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_dangerous_click_even_when_allowlisted_without_opt_in() {
+        assert!(
+            valid_click_url(
+                Some("ms-settings:privacy"),
+                &[
+                    "http".to_string(),
+                    "https".to_string(),
+                    "ms-settings".to_string()
+                ],
+                false,
+                2048
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn allows_dangerous_click_only_when_allowlisted_and_opted_in() {
+        assert_eq!(
+            valid_click_url(
+                Some("file:///C:/x"),
+                &["http".to_string(), "https".to_string(), "file".to_string()],
+                true,
+                2048
+            )
+            .as_deref(),
+            Some("file:///C:/x")
         );
     }
 }
