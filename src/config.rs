@@ -44,6 +44,8 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SecurityConfig {
+    pub allow_http: bool,
+    pub skip_tls_verify: bool,
     pub allow_url_schemes: Vec<String>,
     pub allow_dangerous_url_schemes: bool,
     pub max_click_url_len: usize,
@@ -130,6 +132,8 @@ impl Default for NetworkConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
+            allow_http: false,
+            skip_tls_verify: false,
             allow_url_schemes: vec!["http".to_string(), "https".to_string()],
             allow_dangerous_url_schemes: false,
             max_click_url_len: 2048,
@@ -180,7 +184,7 @@ impl Config {
         }
 
         for sub in &self.subscriptions {
-            validate_subscription(sub)?;
+            validate_subscription(sub, &self.security)?;
         }
         Ok(())
     }
@@ -214,7 +218,10 @@ topics = ["wintfy-rs"]
     }
 }
 
-fn validate_subscription(sub: &SubscriptionConfig) -> Result<(), String> {
+fn validate_subscription(
+    sub: &SubscriptionConfig,
+    security: &SecurityConfig,
+) -> Result<(), String> {
     if sub.name.trim().is_empty() {
         return Err("subscription.name is required".to_string());
     }
@@ -224,7 +231,14 @@ fn validate_subscription(sub: &SubscriptionConfig) -> Result<(), String> {
     let parsed = url::Url::parse(&sub.server)
         .map_err(|err| format!("subscription {} server URL is invalid: {err}", sub.name))?;
     match parsed.scheme() {
-        "http" | "https" => {}
+        "https" => {}
+        "http" if security.allow_http => {}
+        "http" => {
+            return Err(format!(
+                "subscription {} HTTP server URLs require security.allow_http = true",
+                sub.name
+            ));
+        }
         other => {
             return Err(format!(
                 "subscription {} unsupported server scheme: {other}",
@@ -341,6 +355,25 @@ mod tests {
         let config: Config = toml::from_str(Config::example_toml()).unwrap();
         config.validate().unwrap();
         assert_eq!(config.subscriptions[0].server, "https://ntfy.sh");
+        assert!(!config.security.allow_http);
+        assert!(!config.security.skip_tls_verify);
+        assert!(!Config::example_toml().contains("allow_http"));
+        assert!(!Config::example_toml().contains("skip_tls_verify"));
+    }
+
+    #[test]
+    fn rejects_http_server_by_default() {
+        let mut config = Config::default();
+        config.subscriptions[0].server = "http://ntfy.example.com".to_string();
+        assert!(config.validate().unwrap_err().contains("allow_http"));
+    }
+
+    #[test]
+    fn allows_http_server_when_configured() {
+        let mut config = Config::default();
+        config.security.allow_http = true;
+        config.subscriptions[0].server = "http://ntfy.example.com".to_string();
+        config.validate().unwrap();
     }
 
     #[test]

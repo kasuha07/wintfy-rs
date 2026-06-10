@@ -193,8 +193,14 @@ fn read_limited_line<R: Read>(
     }
 }
 
-pub fn agent() -> Result<ureq::Agent, String> {
-    let tls = ureq::native_tls::TlsConnector::new()
+pub fn agent(skip_tls_verify: bool) -> Result<ureq::Agent, String> {
+    let mut tls = ureq::native_tls::TlsConnector::builder();
+    if skip_tls_verify {
+        tls.danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    }
+    let tls = tls
+        .build()
         .map_err(|err| format!("native TLS initialization failed: {err}"))?;
     Ok(ureq::AgentBuilder::new()
         .tls_connector(Arc::new(tls))
@@ -281,7 +287,7 @@ mod tests {
         };
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut items = Vec::new();
-        let agent = agent().unwrap();
+        let agent = agent(false).unwrap();
         let result = read_stream(&agent, &sub, "test", 1024, &shutdown, |item| {
             items.push(item)
         });
@@ -309,7 +315,7 @@ mod tests {
             ..Default::default()
         };
         let shutdown = Arc::new(AtomicBool::new(false));
-        let agent = agent().unwrap();
+        let agent = agent(false).unwrap();
         let err = read_stream(&agent, &sub, "test", 1024, &shutdown, |_| {}).unwrap_err();
         server.join().unwrap();
         assert!(err.slow_backoff);

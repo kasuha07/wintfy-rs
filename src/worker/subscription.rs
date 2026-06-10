@@ -80,7 +80,7 @@ fn run_worker(
     tx: Sender<AppEvent>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let agent = match client::agent() {
+    let agent = match client::agent(security.skip_tls_verify) {
         Ok(agent) => agent,
         Err(err) => {
             log::error!(
