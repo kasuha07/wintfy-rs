@@ -127,9 +127,6 @@ fn run_worker(
                 StreamItem::InvalidJson(err) => {
                     log::warn!("{} stream JSON line ignored: {err}", name);
                 }
-                StreamItem::OversizeLine(size) => {
-                    log::warn!("{} stream line too large ({size} bytes), ignored", name);
-                }
             },
         );
 

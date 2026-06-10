@@ -19,7 +19,6 @@ pub enum StreamItem {
     Message(event::NtfyEvent),
     PollRequest,
     InvalidJson(String),
-    OversizeLine(usize),
 }
 
 #[derive(Debug)]
@@ -114,8 +113,10 @@ where
         match read_limited_line(&mut reader, &mut bytes, line_max_bytes) {
             Ok(LineRead::Eof) => return Err(StreamError::new("stream ended", false)),
             Ok(LineRead::Oversize(n)) => {
-                on_item(StreamItem::OversizeLine(n));
-                continue;
+                return Err(StreamError::new(
+                    format!("stream line too large ({n} bytes)"),
+                    false,
+                ));
             }
             Ok(LineRead::Line) => {
                 while matches!(bytes.last(), Some(b'\n' | b'\r')) {
@@ -179,12 +180,6 @@ fn read_limited_line<R: Read>(
             1 => {
                 total = total.saturating_add(1);
                 if total > line_max_bytes {
-                    while reader.read(&mut byte)? == 1 {
-                        total = total.saturating_add(1);
-                        if byte[0] == b'\n' {
-                            break;
-                        }
-                    }
                     bytes.clear();
                     return Ok(LineRead::Oversize(total));
                 }
@@ -250,25 +245,25 @@ mod tests {
     }
 
     #[test]
-    fn reports_oversize_line() {
+    fn returns_error_on_oversize_line() {
         let input = br#"{"event":"keepalive"}
 "#;
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut items = Vec::new();
-        let _ = read_json_lines(&input[..], 4, &shutdown, |item| items.push(item));
-        assert!(matches!(items[0], StreamItem::OversizeLine(_)));
+        let err = read_json_lines(&input[..], 4, &shutdown, |item| items.push(item)).unwrap_err();
+        assert!(items.is_empty());
+        assert!(err.message.contains("too large"));
     }
 
     #[test]
-    fn continues_after_invalid_and_oversize_lines() {
+    fn stops_after_invalid_then_oversize_line() {
         let input = b"{not-json}\n{\"event\":\"keepalive\",\"padding\":\"xxxxxxxx\"}\n{\"event\":\"message\"}\n";
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut items = Vec::new();
-        let result = read_json_lines(&input[..], 32, &shutdown, |item| items.push(item));
-        assert!(result.is_err());
+        let err = read_json_lines(&input[..], 32, &shutdown, |item| items.push(item)).unwrap_err();
         assert!(matches!(items[0], StreamItem::InvalidJson(_)));
-        assert!(matches!(items[1], StreamItem::OversizeLine(_)));
-        assert!(matches!(items[2], StreamItem::Message(_)));
+        assert_eq!(items.len(), 1);
+        assert!(err.message.contains("too large"));
     }
 
     #[test]
