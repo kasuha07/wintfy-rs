@@ -242,9 +242,16 @@ fn validate_subscription(sub: &SubscriptionConfig) -> Result<(), String> {
     match sub.auth {
         AuthKind::None => {}
         AuthKind::Bearer => {
-            if sub.token.as_deref().unwrap_or("").trim().is_empty() {
+            let token = sub.token.as_deref().unwrap_or("");
+            if token.trim().is_empty() {
                 return Err(format!(
                     "subscription {} bearer auth requires token",
+                    sub.name
+                ));
+            }
+            if token.chars().any(char::is_control) {
+                return Err(format!(
+                    "subscription {} bearer token must not contain control characters",
                     sub.name
                 ));
             }
@@ -335,6 +342,22 @@ mod tests {
         config.subscriptions[0].auth = AuthKind::Bearer;
         config.subscriptions[0].token = None;
         assert!(config.validate().unwrap_err().contains("token"));
+    }
+
+    #[test]
+    fn rejects_bearer_token_with_crlf() {
+        let mut config = Config::default();
+        config.subscriptions[0].auth = AuthKind::Bearer;
+        config.subscriptions[0].token = Some("abc\r\nX-Injected: yes".to_string());
+        assert!(config.validate().unwrap_err().contains("control"));
+    }
+
+    #[test]
+    fn rejects_bearer_token_with_other_control_chars() {
+        let mut config = Config::default();
+        config.subscriptions[0].auth = AuthKind::Bearer;
+        config.subscriptions[0].token = Some("abc\u{7f}".to_string());
+        assert!(config.validate().unwrap_err().contains("control"));
     }
 
     #[test]
