@@ -1,17 +1,22 @@
 pub fn redact_secret(input: &str) -> String {
     let mut output = input.to_string();
     for key in ["token", "password", "authorization", "auth"] {
-        output = redact_key_values(&output, key);
+        if contains_ignore_ascii_case(&output, key) {
+            output = redact_key_values(&output, key);
+        }
     }
-    redact_url_query(&output)
+    if output.contains('?') {
+        redact_url_query(&output)
+    } else {
+        output
+    }
 }
 
 fn redact_key_values(input: &str, key: &str) -> String {
-    let lower = input.to_ascii_lowercase();
     let mut result = String::with_capacity(input.len());
     let mut index = 0;
 
-    while let Some(pos) = lower[index..].find(key) {
+    while let Some(pos) = find_ignore_ascii_case(&input[index..], key) {
         let start = index + pos;
         result.push_str(&input[index..start + key.len()]);
         let after = start + key.len();
@@ -48,18 +53,33 @@ fn redact_key_values(input: &str, key: &str) -> String {
 }
 
 pub fn redact_url_query(input: &str) -> String {
-    let mut result = Vec::new();
-    for part in input.split_whitespace() {
+    let mut output = String::with_capacity(input.len());
+    for (idx, part) in input.split_whitespace().enumerate() {
+        if idx > 0 {
+            output.push(' ');
+        }
         if let Ok(url) = crate::util::url::ParsedUrl::parse(part) {
-            result.push(
-                url.with_redacted_query()
-                    .unwrap_or_else(|| part.to_string()),
-            );
+            if let Some(redacted) = url.with_redacted_query() {
+                output.push_str(&redacted);
+            } else {
+                output.push_str(part);
+            }
         } else {
-            result.push(part.to_string());
+            output.push_str(part);
         }
     }
-    result.join(" ")
+    output
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    find_ignore_ascii_case(haystack, needle).is_some()
+}
+
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 #[cfg(test)]

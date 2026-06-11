@@ -17,7 +17,8 @@ use crate::{
     worker::reconnect::Backoff,
 };
 
-#[derive(Clone)]
+const WORKER_STACK_BYTES: usize = 256 * 1024;
+
 struct WorkerNetwork {
     reconnect_initial_seconds: u64,
     reconnect_max_seconds: u64,
@@ -59,15 +60,21 @@ impl WorkerGroup {
             }
         };
 
-        for sub in config.subscriptions.clone() {
+        let notification = Arc::new(config.notification.clone());
+        let security = Arc::new(config.security.clone());
+        let network = Arc::new(WorkerNetwork::from(&config.network));
+
+        for sub in &config.subscriptions {
             let tx = tx.clone();
             let http = http.clone();
             let worker_shutdown = shutdown.clone();
-            let notification = config.notification.clone();
-            let security = config.security.clone();
-            let network = WorkerNetwork::from(&config.network);
+            let notification = notification.clone();
+            let security = security.clone();
+            let network = network.clone();
+            let sub = sub.clone();
             let handle = thread::Builder::new()
                 .name(format!("ntfy-{}", sub.name))
+                .stack_size(WORKER_STACK_BYTES)
                 .spawn(move || {
                     run_worker(
                         http,
@@ -106,21 +113,21 @@ impl WorkerGroup {
 fn run_worker(
     http: Arc<client::HttpClient>,
     sub: SubscriptionConfig,
-    notification: crate::config::NotificationConfig,
-    security: crate::config::SecurityConfig,
-    network: WorkerNetwork,
+    notification: Arc<crate::config::NotificationConfig>,
+    security: Arc<crate::config::SecurityConfig>,
+    network: Arc<WorkerNetwork>,
     tx: EventSender,
     shutdown: Arc<AtomicBool>,
 ) {
+    let name = sub.name.clone();
     let mut backoff = Backoff::new(
         network.reconnect_initial_seconds,
         network.reconnect_max_seconds,
         network.reconnect_jitter,
     );
-    let mut filter = MessageFilter::new(notification, security);
+    let mut filter = MessageFilter::from_shared(notification, security);
 
     while !shutdown.load(Ordering::Relaxed) {
-        let name = sub.name.clone();
         let result = client::read_stream(
             &http,
             &sub,
@@ -135,10 +142,7 @@ fn run_worker(
                 StreamItem::Keepalive | StreamItem::PollRequest => {}
                 StreamItem::Message(event) => {
                     if let Some(notification) = filter.filter(event) {
-                        let _ = tx.send(AppEvent::NtfyMessage {
-                            subscription: name.clone(),
-                            notification,
-                        });
+                        let _ = tx.try_send_notification(name.clone(), notification);
                     }
                 }
                 StreamItem::InvalidJson(err) => {
@@ -154,9 +158,9 @@ fn run_worker(
         match result {
             Ok(()) => {}
             Err(err) => {
-                log::warn!("subscription {} disconnected: {}", sub.name, err.message);
+                log::warn!("subscription {} disconnected: {}", name, err.message);
                 let _ = tx.send(AppEvent::SubscriptionDisconnected {
-                    name: sub.name.clone(),
+                    name: name.clone(),
                     reason: err.message,
                 });
                 let delay = backoff.next_delay(err.slow_backoff);

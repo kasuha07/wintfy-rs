@@ -2,6 +2,7 @@ use std::{
     process::ExitCode,
     sync::{
         Arc,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::Duration,
@@ -28,7 +29,9 @@ use crate::{
     worker::subscription::WorkerGroup,
 };
 
-#[derive(Debug, Clone)]
+const MAX_QUEUED_NOTIFICATIONS: usize = 64;
+
+#[derive(Debug)]
 pub enum AppEvent {
     TrayReloadConfig,
     TrayOpenConfig,
@@ -47,6 +50,7 @@ pub enum AppEvent {
     NtfyMessage {
         subscription: String,
         notification: Notification,
+        permit: NotificationPermit,
     },
     ConfigReloaded,
     PowerResume,
@@ -56,11 +60,16 @@ pub enum AppEvent {
 pub struct EventSender {
     tx: Sender<AppEvent>,
     wake: Arc<WakeEvent>,
+    queued_notifications: Arc<AtomicUsize>,
 }
 
 impl EventSender {
     fn new(tx: Sender<AppEvent>, wake: Arc<WakeEvent>) -> Self {
-        Self { tx, wake }
+        Self {
+            tx,
+            wake,
+            queued_notifications: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     pub fn send(&self, event: AppEvent) -> bool {
@@ -69,6 +78,61 @@ impl EventSender {
         }
         self.wake.set();
         true
+    }
+
+    pub fn try_send_notification(&self, subscription: String, notification: Notification) -> bool {
+        let Some(permit) = NotificationPermit::try_acquire(self.queued_notifications.clone())
+        else {
+            log::warn!("notification queue full, dropping notification from {subscription}");
+            return false;
+        };
+        self.send(AppEvent::NtfyMessage {
+            subscription,
+            notification,
+            permit,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(tx: Sender<AppEvent>) -> Self {
+        Self {
+            tx,
+            wake: Arc::new(WakeEvent {
+                handle: HANDLE::default(),
+            }),
+            queued_notifications: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NotificationPermit {
+    queued: Arc<AtomicUsize>,
+}
+
+impl NotificationPermit {
+    fn try_acquire(queued: Arc<AtomicUsize>) -> Option<Self> {
+        let mut current = queued.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_QUEUED_NOTIFICATIONS {
+                return None;
+            }
+            match queued.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { queued }),
+                Err(value) => current = value,
+            }
+        }
+    }
+}
+
+impl Drop for NotificationPermit {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -101,6 +165,9 @@ impl WakeEvent {
 
 impl Drop for WakeEvent {
     fn drop(&mut self) {
+        if self.handle.is_invalid() {
+            return;
+        }
         unsafe {
             let _ = CloseHandle(self.handle);
         }
@@ -321,6 +388,7 @@ impl Runtime {
             AppEvent::NtfyMessage {
                 subscription,
                 notification,
+                permit: _permit,
             } => {
                 if self.muted {
                     log::debug!(
@@ -423,5 +491,35 @@ pub(crate) fn dispatch_pending_window_messages() -> bool {
             DispatchMessageW(&msg);
         }
         quit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notification(id: usize) -> Notification {
+        Notification {
+            id: id.to_string(),
+            title: "title".to_string(),
+            body: "body".to_string(),
+            topic: "topic".to_string(),
+            priority: 3,
+            click_url: None,
+        }
+    }
+
+    #[test]
+    fn notification_queue_is_bounded_and_releases_on_drop() {
+        let (tx, rx) = mpsc::channel();
+        let sender = EventSender::new_for_test(tx);
+
+        for id in 0..MAX_QUEUED_NOTIFICATIONS {
+            assert!(sender.try_send_notification("sub".to_string(), notification(id)));
+        }
+        assert!(!sender.try_send_notification("sub".to_string(), notification(999)));
+
+        drop(rx.try_recv().unwrap());
+        assert!(sender.try_send_notification("sub".to_string(), notification(1000)));
     }
 }

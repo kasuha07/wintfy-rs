@@ -1,19 +1,27 @@
+use std::sync::Arc;
+
 use crate::{
     config::{NotificationConfig, SecurityConfig},
     ntfy::event::{Notification, NtfyAttachment, NtfyEvent},
     util::{lru::LruIds, url::ParsedUrl},
 };
 
-const SAFE_CLICK_URL_SCHEMES: &[&str] = &["http", "https"];
-
 pub struct MessageFilter {
     ids: LruIds,
-    notification: NotificationConfig,
-    security: SecurityConfig,
+    notification: Arc<NotificationConfig>,
+    security: Arc<SecurityConfig>,
 }
 
 impl MessageFilter {
+    #[cfg(test)]
     pub fn new(notification: NotificationConfig, security: SecurityConfig) -> Self {
+        Self::from_shared(Arc::new(notification), Arc::new(security))
+    }
+
+    pub fn from_shared(
+        notification: Arc<NotificationConfig>,
+        security: Arc<SecurityConfig>,
+    ) -> Self {
         Self {
             ids: LruIds::new(256),
             notification,
@@ -32,37 +40,41 @@ impl MessageFilter {
             return None;
         }
 
+        let tags_len_hint = event
+            .tags
+            .as_ref()
+            .map(|tags| tags.len().saturating_mul(5))
+            .unwrap_or(0);
         let topic = event.topic.unwrap_or_else(|| "ntfy".to_string());
-        let mut title = event
+        let raw_title = event
             .title
+            .as_deref()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| topic.clone());
+            .unwrap_or(&topic);
+        let mut title = String::with_capacity(raw_title.len().saturating_add(tags_len_hint));
         if self.notification.tags_as_emoji_prefix
             && let Some(tags) = event.tags.as_ref()
         {
-            let mut prefix = String::new();
             for tag in tags {
                 if let Some(value) = tag_to_prefix(tag) {
-                    prefix.push_str(value);
+                    title.push_str(value);
                 }
             }
-            if !prefix.is_empty() {
-                prefix.push(' ');
-                prefix.push_str(&title);
-                title = prefix;
+            if !title.is_empty() {
+                title.push(' ');
             }
         }
-        title = truncate(&title, self.notification.max_title_len);
+        title.push_str(raw_title);
+        let title = truncate_owned(title, self.notification.max_title_len);
 
         let mut body = event.message.unwrap_or_default();
-        if let Some(attachment) = event.attachment.as_ref() {
-            let attachment_line = attachment_summary(attachment);
-            if !attachment_line.is_empty() {
-                if !body.is_empty() {
-                    body.push('\n');
-                }
-                body.push_str(&attachment_line);
+        if let Some(attachment) = event.attachment.as_ref()
+            && attachment.name.is_some()
+        {
+            if !body.is_empty() {
+                body.push('\n');
             }
+            append_attachment_summary(&mut body, attachment);
         }
         let click_url = valid_click_url(
             event.click.as_deref(),
@@ -75,7 +87,7 @@ impl MessageFilter {
         }
         use std::fmt::Write as _;
         let _ = write!(body, "\nTopic: {topic}\nPriority: {priority}");
-        body = truncate(&body, self.notification.max_body_len);
+        let body = truncate_owned(body, self.notification.max_body_len);
 
         Some(Notification {
             id: event.id.unwrap_or_default(),
@@ -88,43 +100,72 @@ impl MessageFilter {
     }
 }
 
-fn attachment_summary(attachment: &NtfyAttachment) -> String {
+fn append_attachment_summary(output: &mut String, attachment: &NtfyAttachment) {
     let Some(name) = attachment.name.as_deref() else {
-        return String::new();
+        return;
     };
-    match attachment.size {
-        Some(size) => format!("Attachment: {name} ({})", format_size(size)),
-        None => format!("Attachment: {name}"),
+    output.push_str("Attachment: ");
+    output.push_str(name);
+    if let Some(size) = attachment.size {
+        output.push_str(" (");
+        write_size(output, size);
+        output.push(')');
     }
 }
 
-fn format_size(size: u64) -> String {
+fn write_size(output: &mut String, size: u64) {
+    use std::fmt::Write as _;
     if size >= 1024 * 1024 {
-        format!("{:.1} MB", size as f64 / 1024.0 / 1024.0)
+        write_one_decimal(output, size, 1024 * 1024, " MB");
     } else if size >= 1024 {
-        format!("{:.1} KB", size as f64 / 1024.0)
+        write_one_decimal(output, size, 1024, " KB");
     } else {
-        format!("{size} B")
+        let _ = write!(output, "{size} B");
     }
+}
+
+fn write_one_decimal(output: &mut String, size: u64, unit: u64, suffix: &str) {
+    use std::fmt::Write as _;
+    let scaled = size.saturating_mul(10).saturating_add(unit / 2) / unit;
+    let _ = write!(output, "{}.{}{}", scaled / 10, scaled % 10, suffix);
 }
 
 fn tag_to_prefix(tag: &str) -> Option<&'static str> {
-    match tag.to_ascii_lowercase().as_str() {
-        "warning" | "warn" => Some("⚠️"),
-        "error" | "alert" | "rotating_light" => Some("🚨"),
-        "white_check_mark" | "ok" | "success" => Some("✅"),
-        "x" | "failed" | "failure" => Some("❌"),
-        "info" => Some("ℹ️"),
-        _ => None,
+    if tag.eq_ignore_ascii_case("warning") || tag.eq_ignore_ascii_case("warn") {
+        Some("⚠️")
+    } else if tag.eq_ignore_ascii_case("error")
+        || tag.eq_ignore_ascii_case("alert")
+        || tag.eq_ignore_ascii_case("rotating_light")
+    {
+        Some("🚨")
+    } else if tag.eq_ignore_ascii_case("white_check_mark")
+        || tag.eq_ignore_ascii_case("ok")
+        || tag.eq_ignore_ascii_case("success")
+    {
+        Some("✅")
+    } else if tag.eq_ignore_ascii_case("x")
+        || tag.eq_ignore_ascii_case("failed")
+        || tag.eq_ignore_ascii_case("failure")
+    {
+        Some("❌")
+    } else if tag.eq_ignore_ascii_case("info") {
+        Some("ℹ️")
+    } else {
+        None
     }
 }
 
-pub fn truncate(input: &str, max_chars: usize) -> String {
+#[cfg(test)]
+fn truncate(input: &str, max_chars: usize) -> String {
+    truncate_owned(input.to_string(), max_chars)
+}
+
+fn truncate_owned(mut input: String, max_chars: usize) -> String {
     let keep = max_chars.saturating_sub(1);
     let mut chars = input.char_indices();
     for _ in 0..max_chars {
         if chars.next().is_none() {
-            return input.to_string();
+            return input;
         }
     }
     let byte_end = if keep == 0 {
@@ -136,10 +177,9 @@ pub fn truncate(input: &str, max_chars: usize) -> String {
             .map(|(idx, _)| idx)
             .unwrap_or(input.len())
     };
-    let mut output = String::with_capacity(byte_end + '…'.len_utf8());
-    output.push_str(&input[..byte_end]);
-    output.push('…');
-    output
+    input.truncate(byte_end);
+    input.push('…');
+    input
 }
 
 pub fn valid_click_url(
@@ -162,10 +202,7 @@ pub fn valid_click_url(
         log::warn!("click URL scheme rejected by allowlist: {scheme}");
         return None;
     }
-    if SAFE_CLICK_URL_SCHEMES
-        .iter()
-        .any(|safe| safe.eq_ignore_ascii_case(scheme))
-    {
+    if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
         return Some(input.to_string());
     }
     if allow_dangerous_schemes {
@@ -267,5 +304,29 @@ mod tests {
             .as_deref(),
             Some("file:///C:/x")
         );
+    }
+
+    #[test]
+    fn truncates_without_splitting_unicode() {
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        assert_eq!(truncate("警报测试", 3), "警报…");
+    }
+
+    #[test]
+    fn formats_attachment_size_like_decimal_display() {
+        let mut output = String::new();
+        write_size(&mut output, 1536);
+        assert_eq!(output, "1.5 KB");
+
+        output.clear();
+        write_size(&mut output, 1024 * 1024 + 512 * 1024);
+        assert_eq!(output, "1.5 MB");
+    }
+
+    #[test]
+    fn tag_prefix_matches_ascii_case_insensitively() {
+        assert_eq!(tag_to_prefix("WARNING"), Some("⚠️"));
+        assert_eq!(tag_to_prefix("Rotating_Light"), Some("🚨"));
+        assert_eq!(tag_to_prefix("White_Check_Mark"), Some("✅"));
     }
 }

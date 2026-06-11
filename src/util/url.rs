@@ -63,6 +63,12 @@ impl<'a> ParsedUrl<'a> {
         split_host_port(authority)
     }
 
+    #[cfg(any(
+        feature = "ureq-client",
+        feature = "winhttp",
+        feature = "native-tls-client",
+        test
+    ))]
     pub fn path(&self) -> &str {
         let end = self
             .query_start
@@ -111,6 +117,12 @@ impl std::fmt::Display for UrlError {
     }
 }
 
+#[cfg(any(
+    feature = "ureq-client",
+    feature = "winhttp",
+    feature = "native-tls-client",
+    test
+))]
 pub fn build_stream_url(server: &str, topics: &[String]) -> Result<String, UrlError> {
     let parsed = ParsedUrl::parse(server)?;
     let Some(authority) = parsed.authority.filter(|authority| !authority.is_empty()) else {

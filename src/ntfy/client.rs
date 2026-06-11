@@ -6,14 +6,24 @@ use std::{
     },
 };
 
-use crate::{
-    config::SubscriptionConfig,
-    ntfy::{auth, event},
-    util::url,
-};
+use crate::{config::SubscriptionConfig, ntfy::event};
 
 #[cfg(any(feature = "winhttp", feature = "native-tls-client"))]
 use crate::util::url::ParsedUrl;
+
+#[cfg(any(
+    feature = "ureq-client",
+    feature = "winhttp",
+    feature = "native-tls-client"
+))]
+use crate::ntfy::auth;
+
+#[cfg(any(
+    feature = "ureq-client",
+    feature = "winhttp",
+    feature = "native-tls-client"
+))]
+use crate::util::url;
 
 #[cfg(any(feature = "winhttp", feature = "native-tls-client"))]
 use std::fmt::Write as _;
@@ -26,6 +36,16 @@ use std::fmt::Write as _;
     )
 ))]
 use std::time::Duration;
+
+const STREAM_BUFFER_BYTES: usize = 4096;
+#[cfg(feature = "native-tls-client")]
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "native-tls-client")]
+const STREAM_HEAD_READ_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(feature = "native-tls-client")]
+const STREAM_BODY_READ_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(all(feature = "winhttp", not(feature = "native-tls-client")))]
+const STREAM_READ_TIMEOUT_MILLIS: u32 = 1_000;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -52,6 +72,12 @@ impl StreamError {
     }
 }
 
+#[cfg(any(
+    feature = "ureq-client",
+    feature = "winhttp",
+    feature = "native-tls-client",
+    test
+))]
 pub fn subscription_url(sub: &SubscriptionConfig) -> Result<String, String> {
     url::build_stream_url(&sub.server, &sub.topics)
         .map_err(|err| format!("invalid server URL for {}: {err}", sub.name))
@@ -72,7 +98,7 @@ pub fn read_stream<F>(
 where
     F: FnMut(StreamItem),
 {
-    let reader = client.open(sub, user_agent)?;
+    let reader = client.open(sub, user_agent, shutdown.clone())?;
     read_json_lines(reader, line_max_bytes, shutdown, on_item)
 }
 
@@ -86,8 +112,8 @@ where
     R: Read,
     F: FnMut(StreamItem),
 {
-    let mut reader = BufReader::new(reader);
-    let mut bytes = Vec::with_capacity(4096);
+    let mut reader = BufReader::with_capacity(STREAM_BUFFER_BYTES, reader);
+    let mut bytes = Vec::with_capacity(STREAM_BUFFER_BYTES);
 
     while !shutdown.load(Ordering::Relaxed) {
         match read_limited_line(&mut reader, &mut bytes, line_max_bytes) {
@@ -96,6 +122,7 @@ where
                 on_item(StreamItem::InvalidJson(format!(
                     "stream line too large ({n} bytes)"
                 )));
+                reset_line_buffer(&mut bytes);
                 continue;
             }
             Ok(LineRead::Line) => {
@@ -103,16 +130,18 @@ where
                     bytes.pop();
                 }
                 if bytes.is_empty() {
+                    reset_line_buffer(&mut bytes);
                     continue;
                 }
-                let line = match std::str::from_utf8(&bytes) {
-                    Ok(line) => line,
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(text) => text,
                     Err(err) => {
                         on_item(StreamItem::InvalidJson(format!("invalid utf-8: {err}")));
+                        reset_line_buffer(&mut bytes);
                         continue;
                     }
                 };
-                match event::parse_line(line) {
+                match event::parse_line(text) {
                     Ok(event) => match event.event.as_str() {
                         "open" => on_item(StreamItem::Open),
                         "keepalive" => on_item(StreamItem::Keepalive),
@@ -125,6 +154,7 @@ where
                     },
                     Err(err) => on_item(StreamItem::InvalidJson(err.to_string())),
                 }
+                reset_line_buffer(&mut bytes);
             }
             Err(err) => return Err(StreamError::new(format!("read failed: {err}"), false)),
         }
@@ -193,6 +223,13 @@ fn read_limited_line<R: BufRead>(
     }
 }
 
+fn reset_line_buffer(bytes: &mut Vec<u8>) {
+    bytes.clear();
+    if bytes.capacity() > STREAM_BUFFER_BYTES {
+        bytes.shrink_to(STREAM_BUFFER_BYTES);
+    }
+}
+
 pub fn agent(skip_tls_verify: bool) -> Result<HttpClient, String> {
     HttpClient::new(skip_tls_verify)
 }
@@ -208,8 +245,13 @@ impl HttpClient {
         })
     }
 
-    fn open(&self, sub: &SubscriptionConfig, user_agent: &str) -> Result<HttpStream, StreamError> {
-        self.backend.open(sub, user_agent)
+    fn open(
+        &self,
+        sub: &SubscriptionConfig,
+        user_agent: &str,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<HttpStream, StreamError> {
+        self.backend.open(sub, user_agent, shutdown)
     }
 }
 
@@ -228,9 +270,14 @@ impl BackendClient {
         })
     }
 
-    fn open(&self, sub: &SubscriptionConfig, user_agent: &str) -> Result<HttpStream, StreamError> {
+    fn open(
+        &self,
+        sub: &SubscriptionConfig,
+        user_agent: &str,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<HttpStream, StreamError> {
         self.session
-            .open_stream(sub, user_agent, self.skip_tls_verify)
+            .open_stream(sub, user_agent, self.skip_tls_verify, shutdown)
     }
 }
 
@@ -256,8 +303,13 @@ impl BackendClient {
         })
     }
 
-    fn open(&self, sub: &SubscriptionConfig, user_agent: &str) -> Result<HttpStream, StreamError> {
-        direct::open_stream(sub, user_agent, &self.tls, self.skip_tls_verify)
+    fn open(
+        &self,
+        sub: &SubscriptionConfig,
+        user_agent: &str,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<HttpStream, StreamError> {
+        direct::open_stream(sub, user_agent, &self.tls, self.skip_tls_verify, shutdown)
     }
 }
 
@@ -292,7 +344,12 @@ impl BackendClient {
         })
     }
 
-    fn open(&self, sub: &SubscriptionConfig, user_agent: &str) -> Result<HttpStream, StreamError> {
+    fn open(
+        &self,
+        sub: &SubscriptionConfig,
+        user_agent: &str,
+        _shutdown: Arc<AtomicBool>,
+    ) -> Result<HttpStream, StreamError> {
         let url = subscription_url(sub).map_err(|err| StreamError::new(err, false))?;
         let mut request = self
             .agent
@@ -347,6 +404,7 @@ impl BackendClient {
         &self,
         _sub: &SubscriptionConfig,
         _user_agent: &str,
+        _shutdown: Arc<AtomicBool>,
     ) -> Result<HttpStream, StreamError> {
         Err(StreamError::new("no HTTP backend enabled", true))
     }
@@ -362,20 +420,33 @@ pub enum HttpStream {
         not(any(feature = "winhttp", feature = "native-tls-client"))
     ))]
     Ureq(Box<dyn Read + Send + Sync + 'static>),
+    #[cfg(not(any(
+        feature = "winhttp",
+        feature = "native-tls-client",
+        feature = "ureq-client"
+    )))]
+    #[allow(dead_code)]
+    Disabled(std::convert::Infallible),
 }
 
 impl Read for HttpStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             #[cfg(all(feature = "winhttp", not(feature = "native-tls-client")))]
-            HttpStream::WinHttp(stream) => stream.read(buf),
+            HttpStream::WinHttp(stream) => stream.read(_buf),
             #[cfg(feature = "native-tls-client")]
-            HttpStream::Direct(stream) => stream.read(buf),
+            HttpStream::Direct(stream) => stream.read(_buf),
             #[cfg(all(
                 feature = "ureq-client",
                 not(any(feature = "winhttp", feature = "native-tls-client"))
             ))]
-            HttpStream::Ureq(stream) => stream.read(buf),
+            HttpStream::Ureq(stream) => stream.read(_buf),
+            #[cfg(not(any(
+                feature = "winhttp",
+                feature = "native-tls-client",
+                feature = "ureq-client"
+            )))]
+            HttpStream::Disabled(never) => match *never {},
         }
     }
 }
@@ -430,6 +501,7 @@ mod direct {
         user_agent: &str,
         tls: &native_tls::TlsConnector,
         _skip_tls_verify: bool,
+        shutdown: Arc<AtomicBool>,
     ) -> Result<HttpStream, StreamError> {
         let url = subscription_url(sub).map_err(|err| StreamError::new(err, false))?;
         let parsed =
@@ -445,8 +517,8 @@ mod direct {
             .ok_or_else(|| StreamError::new("server URL is missing host", false))?;
         let headers = request_headers(user_agent, sub);
 
-        let tcp = connect_with_timeout(strip_ipv6_brackets(host), port, Duration::from_secs(30))?;
-        tcp.set_read_timeout(Some(Duration::from_secs(90)))
+        let tcp = connect_with_timeout(strip_ipv6_brackets(host), port, CONNECT_TIMEOUT)?;
+        tcp.set_read_timeout(Some(STREAM_HEAD_READ_TIMEOUT))
             .map_err(|err| StreamError::new(format!("set read timeout failed: {err}"), false))?;
         tcp.set_write_timeout(Some(Duration::from_secs(30)))
             .map_err(|err| StreamError::new(format!("set write timeout failed: {err}"), false))?;
@@ -466,6 +538,7 @@ mod direct {
             chunked: false,
             chunk_remaining: 0,
             eof: false,
+            shutdown,
         };
         write_request(&mut stream, authority, &target, &headers)?;
         let response = read_response_head(&mut stream)?;
@@ -480,6 +553,10 @@ mod direct {
             ));
         }
         stream.chunked = response.chunked;
+        stream
+            .inner
+            .set_read_timeout(Some(STREAM_BODY_READ_TIMEOUT))
+            .map_err(|err| StreamError::new(format!("set read timeout failed: {err}"), false))?;
         Ok(HttpStream::Direct(stream))
     }
 
@@ -488,12 +565,13 @@ mod direct {
         chunked: bool,
         chunk_remaining: usize,
         eof: bool,
+        shutdown: Arc<AtomicBool>,
     }
 
     impl Read for DirectStream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             if !self.chunked {
-                return self.inner.read(buf);
+                return read_until_data_or_shutdown(&mut self.inner, buf, &self.shutdown);
             }
             self.read_chunked(buf)
         }
@@ -507,20 +585,24 @@ mod direct {
             loop {
                 if self.chunk_remaining > 0 {
                     let max = buf.len().min(self.chunk_remaining);
-                    let n = self.inner.read(&mut buf[..max])?;
+                    let n = read_until_data_or_shutdown(
+                        &mut self.inner,
+                        &mut buf[..max],
+                        &self.shutdown,
+                    )?;
                     if n == 0 {
                         return Ok(0);
                     }
                     self.chunk_remaining -= n;
                     if self.chunk_remaining == 0 {
-                        read_crlf(&mut self.inner)?;
+                        read_crlf(&mut self.inner, &self.shutdown)?;
                     }
                     return Ok(n);
                 }
 
-                let size = read_chunk_size(&mut self.inner)?;
+                let size = read_chunk_size(&mut self.inner, &self.shutdown)?;
                 if size == 0 {
-                    drain_trailers(&mut self.inner)?;
+                    drain_trailers(&mut self.inner, &self.shutdown)?;
                     self.eof = true;
                     return Ok(0);
                 }
@@ -555,6 +637,15 @@ mod direct {
             match self {
                 Self::Plain(stream) => stream.flush(),
                 Self::Tls(stream) => stream.flush(),
+            }
+        }
+    }
+
+    impl Transport {
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            match self {
+                Self::Plain(stream) => stream.set_read_timeout(timeout),
+                Self::Tls(stream) => stream.get_ref().set_read_timeout(timeout),
             }
         }
     }
@@ -627,7 +718,7 @@ mod direct {
             .map_err(|err| StreamError::new(format!("invalid HTTP status code: {err}"), false))
     }
 
-    fn read_chunk_size(stream: &mut Transport) -> io::Result<usize> {
+    fn read_chunk_size(stream: &mut Transport, shutdown: &AtomicBool) -> io::Result<usize> {
         let mut line = Vec::with_capacity(16);
         loop {
             if line.len() >= 64 {
@@ -637,7 +728,7 @@ mod direct {
                 ));
             }
             let mut byte = [0u8; 1];
-            let n = stream.read(&mut byte)?;
+            let n = read_until_data_or_shutdown(stream, &mut byte, shutdown)?;
             if n == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -661,9 +752,9 @@ mod direct {
         }
     }
 
-    fn read_crlf(stream: &mut Transport) -> io::Result<()> {
+    fn read_crlf(stream: &mut Transport, shutdown: &AtomicBool) -> io::Result<()> {
         let mut crlf = [0u8; 2];
-        stream.read_exact(&mut crlf)?;
+        read_exact_until_data_or_shutdown(stream, &mut crlf, shutdown)?;
         if crlf == *b"\r\n" {
             Ok(())
         } else {
@@ -674,7 +765,7 @@ mod direct {
         }
     }
 
-    fn drain_trailers(stream: &mut Transport) -> io::Result<()> {
+    fn drain_trailers(stream: &mut Transport, shutdown: &AtomicBool) -> io::Result<()> {
         let mut total = 0usize;
         loop {
             let mut line = Vec::with_capacity(64);
@@ -686,7 +777,7 @@ mod direct {
                     ));
                 }
                 let mut byte = [0u8; 1];
-                let n = stream.read(&mut byte)?;
+                let n = read_until_data_or_shutdown(stream, &mut byte, shutdown)?;
                 if n == 0 {
                     return Ok(());
                 }
@@ -706,6 +797,49 @@ mod direct {
                 ));
             }
         }
+    }
+
+    fn read_until_data_or_shutdown<R: Read>(
+        reader: &mut R,
+        buf: &mut [u8],
+        shutdown: &AtomicBool,
+    ) -> io::Result<usize> {
+        loop {
+            match reader.read(buf) {
+                Err(err) if is_timeout(&err) && shutdown.load(Ordering::Relaxed) => return Ok(0),
+                Err(err) if is_timeout(&err) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    fn read_exact_until_data_or_shutdown<R: Read>(
+        reader: &mut R,
+        mut buf: &mut [u8],
+        shutdown: &AtomicBool,
+    ) -> io::Result<()> {
+        while !buf.is_empty() {
+            match read_until_data_or_shutdown(reader, buf, shutdown)? {
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF while reading stream",
+                    ));
+                }
+                n => {
+                    let rest = buf;
+                    buf = &mut rest[n..];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_timeout(err: &io::Error) -> bool {
+        matches!(
+            err.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        )
     }
 
     fn connect_with_timeout(
@@ -750,16 +884,16 @@ mod winhttp {
         Win32::{
             Foundation::GetLastError,
             Networking::WinHttp::{
-                SECURITY_FLAG_IGNORE_CERT_CN_INVALID, SECURITY_FLAG_IGNORE_CERT_DATE_INVALID,
-                SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE, SECURITY_FLAG_IGNORE_UNKNOWN_CA,
-                WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_DISABLE_COOKIES, WINHTTP_FLAG_SECURE,
-                WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_OPTION_CONNECT_TIMEOUT,
-                WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_OPTION_RECEIVE_TIMEOUT,
-                WINHTTP_OPTION_RESOLVE_TIMEOUT, WINHTTP_OPTION_SECURITY_FLAGS,
-                WINHTTP_OPTION_SEND_TIMEOUT, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
-                WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
-                WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-                WinHttpSetOption,
+                ERROR_WINHTTP_TIMEOUT, SECURITY_FLAG_IGNORE_CERT_CN_INVALID,
+                SECURITY_FLAG_IGNORE_CERT_DATE_INVALID, SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE,
+                SECURITY_FLAG_IGNORE_UNKNOWN_CA, WINHTTP_ACCESS_TYPE_NO_PROXY,
+                WINHTTP_DISABLE_COOKIES, WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS,
+                WINHTTP_OPTION_CONNECT_TIMEOUT, WINHTTP_OPTION_DISABLE_FEATURE,
+                WINHTTP_OPTION_RECEIVE_TIMEOUT, WINHTTP_OPTION_RESOLVE_TIMEOUT,
+                WINHTTP_OPTION_SECURITY_FLAGS, WINHTTP_OPTION_SEND_TIMEOUT,
+                WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle,
+                WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
+                WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
             },
         },
         core::PCWSTR,
@@ -778,7 +912,7 @@ mod winhttp {
             handle.set_timeout(WINHTTP_OPTION_RESOLVE_TIMEOUT, 30_000)?;
             handle.set_timeout(WINHTTP_OPTION_CONNECT_TIMEOUT, 30_000)?;
             handle.set_timeout(WINHTTP_OPTION_SEND_TIMEOUT, 30_000)?;
-            handle.set_timeout(WINHTTP_OPTION_RECEIVE_TIMEOUT, 90_000)?;
+            handle.set_timeout(WINHTTP_OPTION_RECEIVE_TIMEOUT, STREAM_READ_TIMEOUT_MILLIS)?;
             Ok(Self { handle })
         }
 
@@ -787,6 +921,7 @@ mod winhttp {
             sub: &SubscriptionConfig,
             user_agent: &str,
             skip_tls_verify: bool,
+            shutdown: Arc<AtomicBool>,
         ) -> Result<HttpStream, StreamError> {
             let url = subscription_url(sub).map_err(|err| StreamError::new(err, false))?;
             let parsed =
@@ -826,6 +961,7 @@ mod winhttp {
             Ok(HttpStream::WinHttp(WinHttpStream {
                 _connect: connect,
                 request,
+                shutdown,
             }))
         }
     }
@@ -833,6 +969,7 @@ mod winhttp {
     pub struct WinHttpStream {
         _connect: Handle,
         request: Handle,
+        shutdown: Arc<AtomicBool>,
     }
 
     impl Read for WinHttpStream {
@@ -840,17 +977,25 @@ mod winhttp {
             if buf.is_empty() {
                 return Ok(0);
             }
-            let mut read = 0u32;
-            unsafe {
-                WinHttpReadData(
-                    self.request.raw,
-                    buf.as_mut_ptr().cast(),
-                    buf.len().min(u32::MAX as usize) as u32,
-                    &mut read,
-                )
+            loop {
+                let mut read = 0u32;
+                let result = unsafe {
+                    WinHttpReadData(
+                        self.request.raw,
+                        buf.as_mut_ptr().cast(),
+                        buf.len().min(u32::MAX as usize) as u32,
+                        &mut read,
+                    )
+                };
+                match result {
+                    Ok(()) => return Ok(read as usize),
+                    Err(err) if is_timeout(&err) && self.shutdown.load(Ordering::Relaxed) => {
+                        return Ok(0);
+                    }
+                    Err(err) if is_timeout(&err) => continue,
+                    Err(err) => return Err(io_error(err)),
+                }
             }
-            .map_err(io_error)?;
-            Ok(read as usize)
         }
     }
 
@@ -996,8 +1141,16 @@ mod winhttp {
     unsafe impl Send for Handle {}
     unsafe impl Sync for Handle {}
 
+    fn is_timeout(err: &windows::core::Error) -> bool {
+        err.code() == windows::core::HRESULT::from_win32(ERROR_WINHTTP_TIMEOUT)
+    }
+
     fn io_error(err: windows::core::Error) -> io::Error {
-        io::Error::other(format!("WinHttpReadData failed: {err}"))
+        if is_timeout(&err) {
+            io::Error::new(io::ErrorKind::TimedOut, "WinHttpReadData timed out")
+        } else {
+            io::Error::other(format!("WinHttpReadData failed: {err}"))
+        }
     }
 
     fn strip_ipv6_brackets(host: &str) -> &str {

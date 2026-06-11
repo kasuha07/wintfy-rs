@@ -19,6 +19,7 @@ static LOG_LEVEL: AtomicUsize = AtomicUsize::new(LevelFilter::Info as usize);
 pub struct FileLogger {
     path: PathBuf,
     file: Mutex<File>,
+    bytes: AtomicUsize,
 }
 
 impl Log for FileLogger {
@@ -35,19 +36,32 @@ impl Log for FileLogger {
         };
         let ts = timestamp_seconds();
         let msg = redact_secret(&record.args().to_string());
-        let _ = writeln!(
+        let line_len = decimal_len(ts) + record.target().len() + msg.len() + 11;
+        if writeln!(
             file,
             "{ts} {:<5} [{}] {msg}",
             record.level(),
             record.target()
-        );
-        let _ = file.flush();
-        if file.metadata().map(|m| m.len()).unwrap_or(0) > MAX_LOG_BYTES {
+        )
+        .is_err()
+        {
+            return;
+        }
+        if record.level() <= log::Level::Warn {
+            let _ = file.flush();
+        }
+        let bytes = self
+            .bytes
+            .fetch_add(line_len, Ordering::Relaxed)
+            .saturating_add(line_len);
+        if bytes as u64 > MAX_LOG_BYTES {
             drop(file);
             let _ = rotate_logs(&self.path);
             if let Ok(new_file) = open_log_file(&self.path)
                 && let Ok(mut guard) = self.file.lock()
             {
+                self.bytes
+                    .store(file_len(&new_file) as usize, Ordering::Relaxed);
                 *guard = new_file;
             }
         }
@@ -73,9 +87,11 @@ pub fn init(level_name: &str) -> Result<PathBuf, String> {
     }
     rotate_logs_if_needed(&path)?;
     let file = open_log_file(&path)?;
+    let bytes = file_len(&file) as usize;
     let logger = FileLogger {
         path: path.clone(),
         file: Mutex::new(file),
+        bytes: AtomicUsize::new(bytes),
     };
     match log::set_boxed_logger(Box::new(logger)) {
         Ok(()) => {
@@ -97,6 +113,10 @@ fn open_log_file(path: &Path) -> Result<File, String> {
         .append(true)
         .open(path)
         .map_err(|err| format!("failed to open log file {}: {err}", path.display()))
+}
+
+fn file_len(file: &File) -> u64 {
+    file.metadata().map(|m| m.len()).unwrap_or(0)
 }
 
 fn rotate_logs_if_needed(path: &Path) -> Result<(), String> {
@@ -136,6 +156,15 @@ fn timestamp_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn decimal_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 10 {
+        value /= 10;
+        len += 1;
+    }
+    len
 }
 
 fn set_level(level: LevelFilter) {

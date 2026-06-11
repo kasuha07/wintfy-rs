@@ -52,18 +52,22 @@ mod tests {
 
     #[test]
     fn builds_bearer_header() {
-        let mut sub = SubscriptionConfig::default();
-        sub.auth = AuthKind::Bearer;
-        sub.token = Some("abc".to_string());
+        let sub = SubscriptionConfig {
+            auth: AuthKind::Bearer,
+            token: Some("abc".to_string()),
+            ..Default::default()
+        };
         assert_eq!(auth_header(&sub).as_deref(), Some("Bearer abc"));
     }
 
     #[test]
     fn builds_basic_header() {
-        let mut sub = SubscriptionConfig::default();
-        sub.auth = AuthKind::Basic;
-        sub.username = Some("user".to_string());
-        sub.password = Some("pass".to_string());
+        let sub = SubscriptionConfig {
+            auth: AuthKind::Basic,
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            ..Default::default()
+        };
         assert_eq!(auth_header(&sub).as_deref(), Some("Basic dXNlcjpwYXNz"));
     }
 

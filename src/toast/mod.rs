@@ -70,34 +70,51 @@ fn show_xml(xml: &str) -> Result<(), String> {
 
 #[cfg(feature = "native-toast")]
 fn toast_xml(title: &str, body: &str, launch: Option<&str>) -> String {
-    let activation_attrs = launch
-        .map(|url| {
-            format!(
-                r#" activationType="protocol" launch="{}""#,
-                xml_escape_attr(url)
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        r#"<toast{activation_attrs}><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text></binding></visual></toast>"#,
-        xml_escape_text(title),
-        xml_escape_text(body)
-    )
+    let mut xml = String::with_capacity(
+        title
+            .len()
+            .saturating_add(body.len())
+            .saturating_add(launch.map(str::len).unwrap_or(0))
+            .saturating_add(128),
+    );
+    xml.push_str("<toast");
+    if let Some(url) = launch {
+        xml.push_str(r#" activationType="protocol" launch=""#);
+        push_xml_attr(&mut xml, url);
+        xml.push('"');
+    }
+    xml.push_str(r#"><visual><binding template="ToastGeneric"><text>"#);
+    push_xml_text(&mut xml, title);
+    xml.push_str("</text><text>");
+    push_xml_text(&mut xml, body);
+    xml.push_str("</text></binding></visual></toast>");
+    xml
 }
 
 #[cfg(feature = "native-toast")]
-fn xml_escape_text(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+fn push_xml_text(output: &mut String, input: &str) {
+    for ch in input.chars() {
+        match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            _ => output.push(ch),
+        }
+    }
 }
 
 #[cfg(feature = "native-toast")]
-fn xml_escape_attr(input: &str) -> String {
-    xml_escape_text(input)
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+fn push_xml_attr(output: &mut String, input: &str) {
+    for ch in input.chars() {
+        match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&apos;"),
+            _ => output.push(ch),
+        }
+    }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -110,10 +127,17 @@ mod tests {
 
     #[test]
     fn escapes_xml() {
-        let xml = toast_xml("a < b", "x & y", Some("https://x.test/?a=1&b=2"));
+        let xml = toast_xml(
+            "a < b > c & d",
+            "x & y < z > q",
+            Some("https://x.test/?a=1&b=2\"'<>"),
+        );
         assert!(xml.contains("a &lt; b"));
+        assert!(xml.contains("&gt; c &amp; d"));
         assert!(xml.contains("x &amp; y"));
+        assert!(xml.contains("&lt; z &gt; q"));
         assert!(xml.contains("&amp;b=2"));
+        assert!(xml.contains("&quot;&apos;&lt;&gt;"));
     }
 
     #[test]

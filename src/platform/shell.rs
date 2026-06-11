@@ -9,7 +9,7 @@ use std::{
 
 use windows::{
     Win32::{
-        Storage::EnhancedStorage::PKEY_AppUserModel_ID,
+        Foundation::PROPERTYKEY,
         System::{
             Com::StructuredStorage::{
                 PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0, PropVariantClear,
@@ -22,10 +22,15 @@ use windows::{
         },
         UI::Shell::{IShellLinkW, PropertiesSystem::IPropertyStore, ShellLink},
     },
-    core::{Interface, PCWSTR},
+    core::{GUID, Interface, PCWSTR},
 };
 
 use crate::platform::paths;
+
+const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+    pid: 5,
+};
 
 pub fn open_path(path: &Path) -> Result<(), String> {
     Command::new("explorer.exe")
@@ -71,7 +76,7 @@ pub fn create_shortcut(
             .cast()
             .map_err(|err| format!("IPropertyStore cast failed: {err}"))?;
         let mut prop = propvariant_lpwstr(aumid)?;
-        if let Err(err) = store.SetValue(&PKEY_AppUserModel_ID, &prop) {
+        if let Err(err) = store.SetValue(&PKEY_APP_USER_MODEL_ID, &prop) {
             let _ = PropVariantClear(&mut prop);
             return Err(format!("setting AUMID failed: {err}"));
         }
